@@ -88,6 +88,8 @@ class BMCUManager(object):
         if len(self._u1_planner_socket.encode('utf-8')) >= 100:
             raise config.error('transport_socket_dir is too long for U1 planner')
         self.connect_settle_time = finite_config_float('connect_settle_time', 1.5, minval=0.1, maxval=10.0)
+        # Consumed by the transport sidecar (bmcu_host_bootstrap.py).
+        self.half_duplex = config.getboolean('half_duplex', False)
         self.sidecar_status_interval = finite_config_float(
             'sidecar_status_interval', 1.00, minval=0.05, maxval=10.0)
         self.reconnect_interval = finite_config_float('reconnect_interval', 1.0, minval=0.1, maxval=60.0)

@@ -11,6 +11,7 @@ faults can be armed per request type.
 """
 
 import collections
+import functools
 import heapq
 import os
 import select
@@ -38,7 +39,16 @@ _PAYLOAD_SIZE = {
     protocol.MSG_GET_OP_RESULT: 4, protocol.MSG_ABORT_OP: 0,
     protocol.MSG_UPDATE_CANCEL: 0, protocol.MSG_STOP_ALL: 0,
     protocol.MSG_RESET_ERROR: 0, protocol.MSG_SET_ACTIVE_CH: 1,
+    protocol.MSG_FEED_TO_CONTACT: 10, protocol.MSG_FEED_DISTANCE: 10,
+    protocol.MSG_CHANNEL_RETRACT: 1, protocol.MSG_CHANNEL_PRELOAD: 1,
 }
+
+_OPERATION_TYPES = {
+    protocol.MSG_FEED_TO_CONTACT: protocol.OP_FEED_TO_CONTACT,
+    protocol.MSG_FEED_DISTANCE: protocol.OP_FEED_DISTANCE,
+    protocol.MSG_CHANNEL_RETRACT: protocol.OP_CHANNEL_RETRACT,
+}
+_OP_RESULT = struct.Struct('<IBBBBffI')
 
 Frame = collections.namedtuple(
     'Frame', 'direction time msg_type seq cmd_id payload raw note')
@@ -94,7 +104,10 @@ class BmcuSim(object):
             protocol.MSG_STOP_ALL: self._on_ack,
             protocol.MSG_RESET_ERROR: self._on_ack,
             protocol.MSG_SET_ACTIVE_CH: self._on_set_active_ch,
+            protocol.MSG_CHANNEL_PRELOAD: self._on_preload,
         }
+        for msg_type, op_type in _OPERATION_TYPES.items():
+            self.handlers[msg_type] = functools.partial(self._on_operation, op_type)
         self.decoder = protocol.StreamDecoder()
         self.silent = False
         self.duplicates = 0
@@ -106,6 +119,10 @@ class BmcuSim(object):
         self.event_counter = 1
         self.now_channel = 0xff
         self.present = [0, 0, 0, 0]
+        # op_id -> {'type', 'channel', 'result'}; op_id is the request cmd_id.
+        self.operations = {}
+        self.operations_started = []
+        self.preloading = set()
         self._rotate_session(0)
 
         self._outbox = []
@@ -351,6 +368,40 @@ class BmcuSim(object):
 
     def _on_ack(self, cmd_id, _payload):
         return [ack_reply(cmd_id)]
+
+    def _on_operation(self, op_type, cmd_id, payload):
+        # replay_known_operation(): a repeated op_id acks and replays the
+        # stored result instead of starting a second motion.
+        operation = self.operations.get(cmd_id)
+        if operation is not None:
+            replies = [ack_reply(cmd_id)]
+            if operation['result'] is not None:
+                replies.append((protocol.MSG_OP_RESULT, cmd_id, operation['result']))
+            return replies + [(protocol.MSG_STATUS, 0, self.status_payload())]
+        if payload[0] >= 4:
+            return [error_reply(cmd_id, 31)]
+        self.operations[cmd_id] = {'type': op_type, 'channel': payload[0],
+                                   'result': None}
+        self.operations_started.append(cmd_id)
+        return [ack_reply(cmd_id), (protocol.MSG_STATUS, 0, self.status_payload())]
+
+    def complete_operation(self, op_id, state=protocol.OP_STATE_DONE):
+        """Finish an operation and send its unsolicited OP_RESULT."""
+        with self.lock:
+            operation = self.operations[op_id]
+            operation['result'] = _OP_RESULT.pack(
+                op_id, operation['type'], operation['channel'], state, 1,
+                100.0, 100.0, 1000)
+        self.send(protocol.MSG_OP_RESULT, op_id, operation['result'])
+
+    def _on_preload(self, cmd_id, payload):
+        # A preload is not keyed by op_id: a repeat finds the channel's motion
+        # active and fails with error 40.
+        channel = payload[0]
+        if channel >= 4 or channel in self.preloading:
+            return [error_reply(cmd_id, 40, channel)]
+        self.preloading.add(channel)
+        return [ack_reply(cmd_id), (protocol.MSG_STATUS, 0, self.status_payload())]
 
     def _on_set_active_ch(self, cmd_id, payload):
         if payload[0] >= 4:

@@ -104,3 +104,17 @@ def test_stream_decoder_records_incompatible_version():
     decoder = protocol.StreamDecoder()
     assert decoder.feed(b'\x00' + protocol.cobs_encode(bytes(body)) + b'\x00') == []
     assert decoder.incompatible_version == protocol.PROTO_VERSION + 1
+
+
+def test_stream_decoder_pending_tracks_unterminated_frame():
+    decoder = protocol.StreamDecoder()
+    assert not decoder.pending
+    frame = protocol.encode_packet(protocol.MSG_PING, 1, 2, b'x')
+    assert decoder.feed(frame[:5]) == []
+    assert decoder.pending
+    assert decoder.feed(frame[5:]) == [(protocol.MSG_PING, 1, 2, b'x')]
+    assert not decoder.pending
+    decoder.feed(b'\x00' + b'\x01' * 300)
+    assert decoder.pending
+    decoder.feed(b'\x00')
+    assert not decoder.pending

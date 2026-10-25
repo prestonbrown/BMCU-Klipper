@@ -209,6 +209,11 @@ class StreamDecoder(object):
         self.errors = 0
         self.incompatible_version = None
 
+    @property
+    def pending(self):
+        """True while bytes of an unterminated frame have been received."""
+        return bool(self._buffer) or self._discarding
+
     def feed(self, data):
         packets = []
         for value in bytearray(data):

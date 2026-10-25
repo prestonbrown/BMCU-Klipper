@@ -244,6 +244,7 @@ def _transport_config(path):
         'reconnect': 1.0,
         'status_interval': 1.00,
         'connect_settle': 1.5,
+        'half_duplex': False,
         'devices': [],
     }
     if not os.path.isfile(path) or os.path.islink(path):
@@ -274,6 +275,8 @@ def _transport_config(path):
         'bmcu', 'sidecar_status_interval', fallback=1.00)
     values['connect_settle'] = parser.getfloat(
         'bmcu', 'connect_settle_time', fallback=1.5)
+    values['half_duplex'] = parser.getboolean(
+        'bmcu', 'half_duplex', fallback=False)
     raw = parser.get('bmcu', 'devices', fallback='')
     names = set()
     ports = {}
@@ -548,6 +551,10 @@ def ensure_transport_processes(bmcu_dir, metadata, preferred_name=None, preferre
             'exclude_ports': excluded_serials,
             'logfile': logfile,
         }
+        # Only an enabled half-duplex enters the digest, so existing
+        # full-duplex sidecars keep their digest and are not restarted.
+        if config['half_duplex']:
+            payload['half_duplex'] = True
         settings_digest = hashlib.sha256(json.dumps(
             payload, sort_keys=True, separators=(',', ':')).encode(
                 'utf-8')).hexdigest()
@@ -572,6 +579,8 @@ def ensure_transport_processes(bmcu_dir, metadata, preferred_name=None, preferre
             '--log-file', logfile, '--status-file', status_file,
             '--settings-digest', settings_digest,
         ]
+        if config['half_duplex']:
+            command.append('--half-duplex')
         if item.get('uid'):
             command.extend(['--expected-uid', item['uid']])
         if scan_fallback:

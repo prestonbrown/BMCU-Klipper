@@ -41,6 +41,15 @@ _OPERATION_START_TYPES = frozenset((
     protocol.MSG_FEED_TO_CONTACT, protocol.MSG_FEED_DISTANCE,
     protocol.MSG_CHANNEL_RETRACT, protocol.MSG_CAL_AUTO_START,
 ))
+# Half-duplex resend covers these internal requests; HELLO has its own retry
+# and the heartbeat its own expiry.
+_RESEND_PURPOSES = frozenset(('confirm', 'resume_update', 'snapshot'))
+# A resent preload finds its own motion running and answers error 40, so a
+# preload that started would be reported as failed.
+_NO_RESEND_TYPES = frozenset((protocol.MSG_CHANNEL_PRELOAD,))
+# Half-duplex writes wait at most this long for a partial inbound frame to
+# finish, so line noise cannot hold transmit forever.
+_WRITE_GATE_MAX = 0.05
 
 class TransportDaemon(object):
     def __init__(self, args):
@@ -72,6 +81,8 @@ class TransportDaemon(object):
         self.foreign_uid_until = {}
         self.serial_decoder = protocol.StreamDecoder()
         self.serial_tx = bytearray()
+        self.partial_since = 0.0
+        self.resend = {}
         self.next_serial_connect = 0.0
         self.last_connect_error = ''
         self.serial_settle_until = 0.0
@@ -261,7 +272,58 @@ class TransportDaemon(object):
     def _queue_internal(self, msg_type, payload=b'', purpose='internal'):
         cmd_id = self._next_internal_cmd()
         self._queue_serial(msg_type, cmd_id, payload, purpose=purpose)
+        if purpose in _RESEND_PURPOSES:
+            self._track_resend(msg_type, cmd_id, payload)
         return cmd_id
+
+    def _track_resend(self, msg_type, cmd_id, payload):
+        if not self.args.half_duplex:
+            return
+        self.resend[cmd_id] = {
+            'msg_type': msg_type, 'payload': bytes(payload),
+            'sent_at': time.monotonic(), 'sends': 1,
+        }
+
+    def _resend_wanted(self, cmd_id):
+        if cmd_id >= _INTERNAL_BASE:
+            return cmd_id in self.internal_pending
+        record = self.external_pending.get(cmd_id)
+        return (record is not None and not record.get('orphaned') and
+                record.get('kind') in ('request', 'operation', 'operation_query'))
+
+    def _service_resends(self, now):
+        """Re-send unanswered requests with the same cmd_id and a new seq;
+        the firmware drops a frame whose seq does not advance."""
+        for cmd_id, entry in list(self.resend.items()):
+            if now - entry['sent_at'] < self.args.resend_timeout:
+                continue
+            if not self._resend_wanted(cmd_id):
+                self.resend.pop(cmd_id, None)
+                continue
+            if entry['sends'] >= self.args.resend_attempts:
+                self.resend.pop(cmd_id, None)
+                logging.warning('no reply to 0x%02X cmd=%d after %d sends',
+                                entry['msg_type'], cmd_id, entry['sends'])
+                continue
+            self._queue_serial(entry['msg_type'], cmd_id, entry['payload'])
+            entry['sends'] += 1
+            entry['sent_at'] = now
+            logging.info('resent 0x%02X cmd=%d attempt %d',
+                         entry['msg_type'], cmd_id, entry['sends'])
+
+    def _write_gated(self, now):
+        return (self.args.half_duplex and self.serial_decoder.pending and
+                now - self.partial_since < _WRITE_GATE_MAX)
+
+    def _select_timeout(self, now):
+        timeout = 0.25
+        if not self.args.half_duplex or self.serial is None:
+            return timeout
+        for entry in self.resend.values():
+            timeout = min(timeout, entry['sent_at'] + self.args.resend_timeout - now)
+        if self.serial_tx and self._write_gated(now):
+            timeout = min(timeout, self.partial_since + _WRITE_GATE_MAX - now)
+        return max(0.001, timeout)
 
     def _queue_reliable(self, frame):
         if len(self.reliable) >= _MAX_RELIABLE:
@@ -552,6 +614,7 @@ class TransportDaemon(object):
             self.current_port = port
             self.serial_decoder = protocol.StreamDecoder()
             self.serial_tx[:] = b''
+            self.resend.clear()
             self.serial_generation = (self.serial_generation + 1) & 0xffffffff
             self.seq = 1
             self.internal_pending.clear()
@@ -585,6 +648,7 @@ class TransportDaemon(object):
         self.current_port = ''
         self.serial_tx[:] = b''
         self.serial_decoder = protocol.StreamDecoder()
+        self.resend.clear()
         self.internal_pending.clear()
         self.external_pending.clear()
         self.operation_wire_by_client.clear()
@@ -750,6 +814,8 @@ class TransportDaemon(object):
                 payload = struct.pack('<I', target_wire)
         self.external_pending[wire_cmd] = record
         self._queue_serial(msg_type, wire_cmd, payload)
+        if msg_type not in _NO_RESEND_TYPES:
+            self._track_resend(msg_type, wire_cmd, payload)
 
     def _handle_control(self, data):
         if not data:
@@ -787,6 +853,8 @@ class TransportDaemon(object):
 
     def _handle_serial_packet(self, msg_type, seq, cmd_id, payload):
         self.last_serial_rx = time.monotonic()
+        if msg_type & 0x80:
+            self.resend.pop(cmd_id, None)
         purpose = self.internal_pending.get(cmd_id)
         if purpose == 'hello' and msg_type == protocol.MSG_HELLO_ACK:
             hello = protocol.parse_hello(payload)
@@ -937,7 +1005,10 @@ class TransportDaemon(object):
                     payload = struct.pack(
                         '<IBH', record.get('client_cmd'), ok, error)
 
-                if (kind == 'operation' and
+                # A resend can draw a second ACK for the same operation.
+                duplicate = self.args.half_duplex and record.get('acked')
+                record['acked'] = True
+                if (kind == 'operation' and not duplicate and
                         record.get('epoch') == self.client_epoch):
                     self._queue_packet_client(
                         msg_type, seq, record.get('client_cmd'), payload,
@@ -972,7 +1043,10 @@ class TransportDaemon(object):
         if not data:
             raise OSError(errno.EIO, 'serial EOF')
         previous = self.serial_decoder.errors
+        was_pending = self.serial_decoder.pending
         packets = self.serial_decoder.feed(data)
+        if self.serial_decoder.pending and (packets or not was_pending):
+            self.partial_since = time.monotonic()
         if self.serial_decoder.incompatible_version is not None:
             raise RuntimeError('incompatible BMCU protocol version')
         if self.serial_decoder.errors != previous:
@@ -1056,6 +1130,11 @@ class TransportDaemon(object):
                         self._close_serial(str(exc))
                 if now - self.last_serial_rx > self.args.connection_timeout:
                     self._close_serial('receive timeout after heartbeat retries')
+            if self.serial is not None and self.resend:
+                try:
+                    self._service_resends(now)
+                except Exception as exc:
+                    self._close_serial(str(exc))
         if self.external_pending:
             expired = [wire for wire, value in self.external_pending.items()
                        if value.get('deadline', 0.0) <= now]
@@ -1087,11 +1166,11 @@ class TransportDaemon(object):
                         writes.append(self.client)
                 if self.serial is not None:
                     reads.append(self.serial.fileno())
-                    if self.serial_tx:
+                    if self.serial_tx and not self._write_gated(now):
                         writes.append(self.serial.fileno())
                 try:
                     readable, writable, _errors = select.select(
-                        reads, writes, [], 0.25)
+                        reads, writes, [], self._select_timeout(now))
                 except InterruptedError:
                     continue
                 for item in readable:
@@ -1151,6 +1230,9 @@ def parse_args():
     parser.add_argument('--log-file', required=True)
     parser.add_argument('--status-file', required=True)
     parser.add_argument('--settings-digest', default='')
+    parser.add_argument('--half-duplex', action='store_true')
+    parser.add_argument('--resend-timeout', type=float, default=0.25)
+    parser.add_argument('--resend-attempts', type=int, default=3)
     args = parser.parse_args()
     args.expected_uid = str(args.expected_uid or '').strip().upper()
     args.exclude_ports = tuple(str(value) for value in (args.exclude_port or []) if value)

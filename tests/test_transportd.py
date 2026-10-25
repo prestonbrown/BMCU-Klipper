@@ -74,7 +74,8 @@ class Harness(object):
             heartbeat=5.0, connection_timeout=15.0, reconnect=0.1,
             status_interval=0.5, connect_settle=0.0,
             status_file=str(tmp_path / 'status.json'),
-            settings_digest='', lifetime_lock=lock, process_record={})
+            settings_digest='', lifetime_lock=lock, process_record={},
+            half_duplex=False, resend_timeout=0.25, resend_attempts=3)
         options.update(overrides)
         self.args = argparse.Namespace(**options)
         self.daemon = bmcu_transportd.TransportDaemon(self.args)
@@ -390,5 +391,287 @@ def test_sim_drops_stale_seq_like_firmware():
         pongs = sim.frames('tx', protocol.MSG_PONG)
         assert [f.cmd_id for f in pongs] == [3, 6]
         assert sim.duplicates == 2
+    finally:
+        sim.close()
+
+
+FEED = struct.pack('<BfBI', 1, 100.0, 0, 5000)
+
+
+def start_half_duplex(start, **overrides):
+    options = dict(half_duplex=True, resend_timeout=0.1, resend_attempts=3)
+    options.update(overrides)
+    return start(**options)
+
+
+def test_parse_args_half_duplex_defaults(monkeypatch):
+    base = ['bmcu_transportd', '--name', 'n', '--port', '/dev/null',
+            '--socket', '/tmp/s', '--log-file', '/tmp/l', '--status-file', '/tmp/f']
+    monkeypatch.setattr('sys.argv', base)
+    args = bmcu_transportd.parse_args()
+    assert (args.half_duplex, args.resend_timeout, args.resend_attempts) == (False, 0.25, 3)
+    monkeypatch.setattr('sys.argv', base + ['--half-duplex', '--resend-timeout', '0.5',
+                                            '--resend-attempts', '5'])
+    args = bmcu_transportd.parse_args()
+    assert (args.half_duplex, args.resend_timeout, args.resend_attempts) == (True, 0.5, 5)
+
+
+def test_half_duplex_lost_request_is_resent_with_same_cmd_and_new_seq(start, sim):
+    h = start_half_duplex(start)
+    client = h.connect()
+    h.wait_ready()
+    sim.add_fault('ignore', protocol.MSG_PING)
+    client.send(protocol.MSG_PING, 70, b'r')
+    assert wait_until(lambda: client.packets(protocol.MSG_PONG, 70))
+    wire = sim.frames('rx', protocol.MSG_PING)
+    assert len(wire) == 2
+    assert wire[0].cmd_id == wire[1].cmd_id
+    assert wire[1].seq > wire[0].seq
+    assert wire[1].time - wire[0].time >= 0.08
+    assert wire[1].payload == b'r'
+    assert len(client.packets(protocol.MSG_PONG, 70)) == 1
+
+
+def test_half_duplex_lost_operation_ack_does_not_start_a_second_operation(start, sim):
+    h = start_half_duplex(start)
+    client = h.connect()
+    h.wait_ready()
+    sim.add_fault('drop', protocol.MSG_FEED_DISTANCE)
+    client.send(protocol.MSG_FEED_DISTANCE, 300, FEED)
+    ack = wait_until(lambda: client.packets(protocol.MSG_ACK, 300))
+    assert ack and struct.unpack('<IBH', ack[0][4]) == (300, 1, 0)
+    wire = sim.frames('rx', protocol.MSG_FEED_DISTANCE)
+    assert len(wire) == 2 and wire[0].cmd_id == wire[1].cmd_id
+    assert sim.operations_started == [wire[0].cmd_id]
+    # The ACK ends resending while the operation is still running.
+    time.sleep(0.3)
+    assert len(sim.frames('rx', protocol.MSG_FEED_DISTANCE)) == 2
+    sim.complete_operation(wire[0].cmd_id)
+    result = wait_until(lambda: client.packets(protocol.MSG_OP_RESULT, 300))
+    assert result and protocol.parse_op_result(result[0][4])['op_id'] == 300
+    assert len(client.packets(protocol.MSG_ACK, 300)) == 1
+
+
+def test_half_duplex_late_operation_ack_reaches_client_once(start, sim):
+    h = start_half_duplex(start)
+    client = h.connect()
+    h.wait_ready()
+    sim.add_fault('delay', protocol.MSG_FEED_DISTANCE, seconds=0.2)
+    client.send(protocol.MSG_FEED_DISTANCE, 301, FEED)
+    assert wait_until(lambda: client.packets(protocol.MSG_ACK, 301))
+    # Both the replayed and the delayed original ACK reach the daemon.
+    assert wait_until(lambda: len(sim.frames('tx', protocol.MSG_ACK)) >= 4)
+    client.send(protocol.MSG_PING, 302, b'sync')
+    assert wait_until(lambda: client.packets(protocol.MSG_PONG, 302))
+    assert len(sim.operations_started) == 1
+    assert len(client.packets(protocol.MSG_ACK, 301)) == 1
+
+
+def test_half_duplex_corrupted_reply_is_resent(start, sim):
+    h = start_half_duplex(start)
+    client = h.connect()
+    h.wait_ready()
+    sim.add_fault('corrupt', protocol.MSG_PING)
+    client.send(protocol.MSG_PING, 71, b'c')
+    assert wait_until(lambda: client.packets(protocol.MSG_PONG, 71))
+    assert len(sim.frames('rx', protocol.MSG_PING)) == 2
+    assert h.daemon.serial_decoder.errors >= 1
+    assert len(client.packets(protocol.MSG_PONG, 71)) == 1
+
+
+def test_half_duplex_resend_stops_at_max_attempts(start, sim):
+    h = start_half_duplex(start, resend_attempts=3)
+    client = h.connect()
+    h.wait_ready()
+    sim.add_fault('ignore', protocol.MSG_PING, count=-1)
+    client.send(protocol.MSG_PING, 72, b'x')
+    assert wait_until(lambda: len(sim.frames('rx', protocol.MSG_PING)) >= 3, 1.0)
+    time.sleep(0.35)
+    wire = sim.frames('rx', protocol.MSG_PING)
+    assert len(wire) == 3
+    assert len({f.cmd_id for f in wire}) == 1
+    assert [f.seq for f in wire] == sorted({f.seq for f in wire})
+    assert all(b.time - a.time >= 0.08 for a, b in zip(wire, wire[1:]))
+    assert not client.packets(protocol.MSG_PONG, 72)
+    # The request keeps the ordinary external timeout bookkeeping.
+    assert wire[0].cmd_id in h.daemon.external_pending
+    assert not h.daemon.resend
+    assert h.daemon.session_ready
+
+
+def test_half_duplex_no_resend_once_a_reply_arrived(start, sim):
+    h = start_half_duplex(start)
+    client = h.connect()
+    h.wait_ready()
+    sim.add_fault('status_before', protocol.MSG_PING)
+    client.send(protocol.MSG_PING, 73, b's')
+    assert wait_until(lambda: client.packets(protocol.MSG_PONG, 73))
+    time.sleep(0.3)
+    assert len(sim.frames('rx', protocol.MSG_PING)) == 1
+    assert not h.daemon.resend
+
+
+def test_half_duplex_error_reply_also_stops_resend(start, sim):
+    h = start_half_duplex(start)
+    client = h.connect()
+    h.wait_ready()
+    client.send(protocol.MSG_SET_ACTIVE_CH, 74, b'\x07')
+    assert wait_until(lambda: client.packets(protocol.MSG_ERROR, 74))
+    time.sleep(0.3)
+    assert len(sim.frames('rx', protocol.MSG_SET_ACTIVE_CH)) == 1
+
+
+def test_full_duplex_never_resends(start, sim):
+    h = start(resend_timeout=0.1)
+    client = h.connect()
+    h.wait_ready()
+    sim.add_fault('ignore', protocol.MSG_PING)
+    client.send(protocol.MSG_PING, 75, b'n')
+    time.sleep(0.45)
+    assert len(sim.frames('rx', protocol.MSG_PING)) == 1
+    assert not client.packets(protocol.MSG_PONG, 75)
+    assert not h.daemon.resend
+
+
+def test_half_duplex_channel_preload_is_never_resent(start, sim):
+    h = start_half_duplex(start)
+    client = h.connect()
+    h.wait_ready()
+    sim.add_fault('ignore', protocol.MSG_CHANNEL_PRELOAD)
+    client.send(protocol.MSG_CHANNEL_PRELOAD, 76, b'\x01')
+    time.sleep(0.35)
+    assert len(sim.frames('rx', protocol.MSG_CHANNEL_PRELOAD)) == 1
+
+
+def test_half_duplex_stops_resending_when_client_leaves(start, sim):
+    h = start_half_duplex(start, resend_attempts=50)
+    client = h.connect()
+    h.wait_ready()
+    sim.add_fault('ignore', protocol.MSG_PING, count=-1)
+    client.send(protocol.MSG_PING, 77, b'g')
+    assert wait_until(lambda: len(sim.frames('rx', protocol.MSG_PING)) >= 2)
+    client.close()
+    h.clients.remove(client)
+    assert wait_until(lambda: not h.daemon.external_pending)
+    time.sleep(0.05)
+    sent = len(sim.frames('rx', protocol.MSG_PING))
+    time.sleep(0.3)
+    assert len(sim.frames('rx', protocol.MSG_PING)) == sent
+
+
+def test_half_duplex_orphaned_operation_is_not_resent(start, sim):
+    h = start_half_duplex(start, resend_attempts=50)
+    client = h.connect()
+    h.wait_ready()
+    sim.add_fault('ignore', protocol.MSG_FEED_DISTANCE, count=-1)
+    client.send(protocol.MSG_FEED_DISTANCE, 310, FEED)
+    assert wait_until(lambda: len(sim.frames('rx', protocol.MSG_FEED_DISTANCE)) >= 2)
+    client.close()
+    h.clients.remove(client)
+    assert wait_until(lambda: sim.frames('rx', protocol.MSG_ABORT_OP))
+    time.sleep(0.05)
+    sent = len(sim.frames('rx', protocol.MSG_FEED_DISTANCE))
+    time.sleep(0.3)
+    assert len(sim.frames('rx', protocol.MSG_FEED_DISTANCE)) == sent
+
+
+@pytest.mark.parametrize('action', ['ignore', 'drop'])
+def test_half_duplex_lost_session_confirm_is_resent(tmp_path, sim, start, action):
+    sim.add_fault(action, protocol.MSG_SESSION_CONFIRM)
+    began = time.monotonic()
+    h = start_half_duplex(start)
+    h.wait_ready()
+    # Ready before the 1 s HELLO restart, on the first session.
+    assert time.monotonic() - began < 0.9
+    assert len(sim.frames('rx', protocol.MSG_HELLO)) == 1
+    confirms = sim.frames('rx', protocol.MSG_SESSION_CONFIRM)
+    assert len(confirms) == 2
+    assert confirms[0].cmd_id == confirms[1].cmd_id
+    assert confirms[1].seq > confirms[0].seq
+
+
+@pytest.mark.parametrize('msg_type', [protocol.MSG_UPDATE_CANCEL,
+                                      protocol.MSG_GET_SNAPSHOT])
+def test_half_duplex_lost_startup_request_is_resent(start, sim, msg_type):
+    sim.add_fault('ignore', msg_type)
+    h = start_half_duplex(start)
+    h.wait_ready()
+    wire = sim.frames('rx', msg_type)
+    assert len(wire) == 2 and wire[0].cmd_id == wire[1].cmd_id
+
+
+def test_half_duplex_write_waits_for_partial_frame(start, sim):
+    h = start_half_duplex(start)
+    client = h.connect()
+    h.wait_ready()
+    frame = protocol.encode_packet(protocol.MSG_STATUS, 999, 0, sim.status_payload())
+    head, tail = frame[:20], frame[20:]
+    sim.send_raw(head)
+    assert wait_until(lambda: h.daemon.serial_decoder.pending)
+    client.send(protocol.MSG_PING, 80, b'g')
+    time.sleep(0.02)
+    sim.send_raw(tail)
+    assert wait_until(lambda: client.packets(protocol.MSG_PONG, 80))
+    tail_sent = [f for f in sim.frames('tx') if f.raw == tail][0]
+    assert sim.frames('rx', protocol.MSG_PING)[-1].time >= tail_sent.time
+
+
+def test_half_duplex_write_gate_releases_after_bound(start, sim):
+    # A long resend timeout keeps the resend timer from waking the loop.
+    h = start_half_duplex(start, resend_timeout=1.0)
+    client = h.connect()
+    h.wait_ready()
+    sim.send_raw(b'\x00\x05\x01\x02')
+    assert wait_until(lambda: h.daemon.serial_decoder.pending)
+    noise = [f for f in sim.frames('tx') if f.raw == b'\x00\x05\x01\x02'][0]
+    client.send(protocol.MSG_PING, 81, b'b')
+    assert wait_until(lambda: client.packets(protocol.MSG_PONG, 81), 1.0)
+    held = sim.frames('rx', protocol.MSG_PING)[-1].time - noise.time
+    assert 0.05 <= held < 0.2
+
+
+def test_partial_frame_age_restarts_with_each_new_frame(start, sim):
+    h = start_half_duplex(start)
+    h.wait_ready()
+    first = protocol.encode_packet(protocol.MSG_STATUS, 900, 0, sim.status_payload())
+    second = protocol.encode_packet(protocol.MSG_STATUS, 901, 0, sim.status_payload())
+    sim.send_raw(first[:20])
+    assert wait_until(lambda: h.daemon.serial_decoder.pending)
+    between = time.monotonic()
+    statuses = h.daemon.latest_status
+    # The rest of one frame and the start of the next arrive in one read.
+    sim.send_raw(first[20:] + second[:20])
+    assert wait_until(lambda: h.daemon.latest_status is not statuses and
+                      h.daemon.serial_decoder.pending)
+    assert h.daemon.partial_since >= between
+
+
+def test_full_duplex_write_ignores_partial_frame(start, sim):
+    h = start()
+    client = h.connect()
+    h.wait_ready()
+    sim.send_raw(b'\x00\x05\x01\x02')
+    assert wait_until(lambda: h.daemon.serial_decoder.pending)
+    sent = time.monotonic()
+    client.send(protocol.MSG_PING, 82, b'f')
+    assert wait_until(lambda: client.packets(protocol.MSG_PONG, 82))
+    assert sim.frames('rx', protocol.MSG_PING)[-1].time - sent < 0.045
+
+
+def test_sim_replays_operations_and_rejects_repeated_preload():
+    sim = BmcuSim()
+    try:
+        sim.handle_packet(protocol.MSG_HELLO, 1, 1, b'\0\0\0\0')
+        sim.handle_packet(protocol.MSG_SESSION_CONFIRM, 2, 2,
+                          struct.pack('<I', sim.session_id))
+        sim.handle_packet(protocol.MSG_FEED_DISTANCE, 3, 50, FEED)
+        sim.handle_packet(protocol.MSG_FEED_DISTANCE, 4, 50, FEED)
+        assert sim.operations_started == [50]
+        sim.handle_packet(protocol.MSG_CHANNEL_PRELOAD, 5, 60, b'\x02')
+        sim.handle_packet(protocol.MSG_CHANNEL_PRELOAD, 6, 60, b'\x02')
+        assert sim.wait_for(lambda: sim.frames('tx', protocol.MSG_ERROR))
+        error = sim.frames('tx', protocol.MSG_ERROR)[0]
+        assert error.cmd_id == 60 and struct.unpack('<BHI', error.payload)[1] == 40
+        assert len([f for f in sim.frames('tx', protocol.MSG_ACK) if f.cmd_id == 50]) == 2
     finally:
         sim.close()
