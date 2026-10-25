@@ -457,6 +457,31 @@ def _wait_transport_online(process, status_file, name, expected_uid, timeout):
     raise BootstrapError(
         'preferred BMCU transport did not become online: %s' % last)
 
+def _transport_command(daemon, config, item, socket_path, logfile,
+                       status_file, settings_digest, excluded_serials):
+    command = [
+        sys.executable, '-I', '-S', daemon,
+        '--name', item['name'], '--port', item['port'],
+        '--socket', socket_path,
+        '--baud', str(config['baud']),
+        '--heartbeat', str(config['heartbeat']),
+        '--connection-timeout', str(config['connection_timeout']),
+        '--reconnect', str(config['reconnect']),
+        '--status-interval', str(config['status_interval']),
+        '--connect-settle', str(config['connect_settle']),
+        '--log-file', logfile, '--status-file', status_file,
+        '--settings-digest', settings_digest,
+    ]
+    if config['half_duplex']:
+        command.append('--half-duplex')
+    if item.get('uid'):
+        command.extend(['--expected-uid', item['uid']])
+        # A device named by UID may be found on another port.
+        command.append('--scan-fallback')
+        for excluded in excluded_serials:
+            command.extend(['--exclude-port', excluded])
+    return command
+
 def ensure_transport_processes(bmcu_dir, metadata, preferred_name=None, preferred_online_timeout=0.0):
 
     runtime = os.path.realpath(os.path.join(bmcu_dir, 'runtime'))
@@ -567,26 +592,9 @@ def ensure_transport_processes(bmcu_dir, metadata, preferred_name=None, preferre
             records[name] = old
             continue
         _stop_transport_record(old, runtime)
-        command = [
-            sys.executable, '-I', '-S', daemon,
-            '--name', name, '--port', port, '--socket', socket_path,
-            '--baud', str(config['baud']),
-            '--heartbeat', str(config['heartbeat']),
-            '--connection-timeout', str(config['connection_timeout']),
-            '--reconnect', str(config['reconnect']),
-            '--status-interval', str(config['status_interval']),
-            '--connect-settle', str(config['connect_settle']),
-            '--log-file', logfile, '--status-file', status_file,
-            '--settings-digest', settings_digest,
-        ]
-        if config['half_duplex']:
-            command.append('--half-duplex')
-        if item.get('uid'):
-            command.extend(['--expected-uid', item['uid']])
-        if scan_fallback:
-            command.append('--scan-fallback')
-            for excluded in excluded_serials:
-                command.extend(['--exclude-port', excluded])
+        command = _transport_command(
+            daemon, config, item, socket_path, logfile, status_file,
+            settings_digest, excluded_serials)
         process = subprocess.Popen(
             command, stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
