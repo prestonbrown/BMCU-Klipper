@@ -10,6 +10,7 @@ import logging
 import logging.handlers
 import json
 import os
+import random
 import select
 import signal
 import socket
@@ -50,10 +51,14 @@ _NO_RESEND_TYPES = frozenset((protocol.MSG_CHANNEL_PRELOAD,))
 # Half-duplex writes wait at most this long for a partial inbound frame to
 # finish, so line noise cannot hold transmit forever.
 _WRITE_GATE_MAX = 0.05
+# Each resend wait is resend_timeout scaled by a factor drawn from this range,
+# so host retries cannot phase-lock with the firmware's periodic STATUS.
+_RESEND_JITTER = (0.8, 1.2)
 
 class TransportDaemon(object):
-    def __init__(self, args):
+    def __init__(self, args, rng=None):
         self.args = args
+        self.rng = rng if rng is not None else random.Random()
         self.running = True
         self.listener = None
         self.control = None
@@ -281,8 +286,11 @@ class TransportDaemon(object):
             return
         self.resend[cmd_id] = {
             'msg_type': msg_type, 'payload': bytes(payload),
-            'sent_at': time.monotonic(), 'sends': 1,
+            'due': time.monotonic() + self._resend_wait(), 'sends': 1,
         }
+
+    def _resend_wait(self):
+        return self.args.resend_timeout * self.rng.uniform(*_RESEND_JITTER)
 
     def _resend_wanted(self, cmd_id):
         if cmd_id >= _INTERNAL_BASE:
@@ -295,7 +303,7 @@ class TransportDaemon(object):
         """Re-send unanswered requests with the same cmd_id and a new seq;
         the firmware drops a frame whose seq does not advance."""
         for cmd_id, entry in list(self.resend.items()):
-            if now - entry['sent_at'] < self.args.resend_timeout:
+            if now < entry['due']:
                 continue
             if not self._resend_wanted(cmd_id):
                 self.resend.pop(cmd_id, None)
@@ -307,7 +315,7 @@ class TransportDaemon(object):
                 continue
             self._queue_serial(entry['msg_type'], cmd_id, entry['payload'])
             entry['sends'] += 1
-            entry['sent_at'] = now
+            entry['due'] = now + self._resend_wait()
             logging.info('resent 0x%02X cmd=%d attempt %d',
                          entry['msg_type'], cmd_id, entry['sends'])
 
@@ -320,7 +328,7 @@ class TransportDaemon(object):
         if not self.args.half_duplex or self.serial is None:
             return timeout
         for entry in self.resend.values():
-            timeout = min(timeout, entry['sent_at'] + self.args.resend_timeout - now)
+            timeout = min(timeout, entry['due'] - now)
         if self.serial_tx and self._write_gated(now):
             timeout = min(timeout, self.partial_since + _WRITE_GATE_MAX - now)
         return max(0.001, timeout)

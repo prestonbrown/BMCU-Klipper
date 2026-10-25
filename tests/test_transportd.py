@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 import argparse
+import random
 import socket
 import struct
 import threading
@@ -64,7 +65,7 @@ def wait_until(predicate, timeout=2.0):
 
 
 class Harness(object):
-    def __init__(self, tmp_path, sim, **overrides):
+    def __init__(self, tmp_path, sim, rng=None, **overrides):
         self.sim = sim
         lock = open(str(tmp_path / 'transport.lock'), 'w+')
         options = dict(
@@ -78,7 +79,8 @@ class Harness(object):
             half_duplex=False, resend_timeout=0.25, resend_attempts=3)
         options.update(overrides)
         self.args = argparse.Namespace(**options)
-        self.daemon = bmcu_transportd.TransportDaemon(self.args)
+        self.daemon = bmcu_transportd.TransportDaemon(
+            self.args, rng if rng is not None else random.Random(1))
         self.error = None
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
@@ -427,7 +429,7 @@ def test_half_duplex_lost_request_is_resent_with_same_cmd_and_new_seq(start, sim
     assert len(wire) == 2
     assert wire[0].cmd_id == wire[1].cmd_id
     assert wire[1].seq > wire[0].seq
-    assert wire[1].time - wire[0].time >= 0.08
+    assert wire[1].time - wire[0].time >= 0.07
     assert wire[1].payload == b'r'
     assert len(client.packets(protocol.MSG_PONG, 70)) == 1
 
@@ -491,7 +493,7 @@ def test_half_duplex_resend_stops_at_max_attempts(start, sim):
     assert len(wire) == 3
     assert len({f.cmd_id for f in wire}) == 1
     assert [f.seq for f in wire] == sorted({f.seq for f in wire})
-    assert all(b.time - a.time >= 0.08 for a, b in zip(wire, wire[1:]))
+    assert all(b.time - a.time >= 0.07 for a, b in zip(wire, wire[1:]))
     assert not client.packets(protocol.MSG_PONG, 72)
     # The request keeps the ordinary external timeout bookkeeping.
     assert wire[0].cmd_id in h.daemon.external_pending
@@ -675,3 +677,49 @@ def test_sim_replays_operations_and_rejects_repeated_preload():
         assert len([f for f in sim.frames('tx', protocol.MSG_ACK) if f.cmd_id == 50]) == 2
     finally:
         sim.close()
+
+
+class FixedUniform(object):
+    """An rng whose uniform() returns one end of the requested range."""
+
+    def __init__(self, end):
+        self.end = end
+        self.calls = []
+
+    def uniform(self, low, high):
+        self.calls.append((low, high))
+        return high if self.end == 'high' else low
+
+
+@pytest.mark.parametrize('end,factor', [('low', 0.8), ('high', 1.2)])
+def test_resend_wait_jitter_bounds(end, factor):
+    args = argparse.Namespace(resend_timeout=0.25)
+    rng = FixedUniform(end)
+    daemon = bmcu_transportd.TransportDaemon(args, rng)
+    assert daemon._resend_wait() == pytest.approx(0.25 * factor)
+    assert rng.calls == [(0.8, 1.2)]
+
+
+def test_resend_wait_varies_and_stays_in_bounds():
+    args = argparse.Namespace(resend_timeout=0.25)
+    daemon = bmcu_transportd.TransportDaemon(args, random.Random(7))
+    waits = [daemon._resend_wait() for _ in range(200)]
+    assert all(0.2 <= wait <= 0.3 for wait in waits)
+    assert len(set(waits)) > 100
+
+
+def test_half_duplex_resend_waits_use_jitter(tmp_path, sim):
+    rng = FixedUniform('high')
+    h = Harness(tmp_path, sim, rng=rng, half_duplex=True,
+                resend_timeout=0.1, resend_attempts=3)
+    try:
+        client = h.connect()
+        h.wait_ready()
+        sim.add_fault('ignore', protocol.MSG_PING, count=-1)
+        client.send(protocol.MSG_PING, 90, b'j')
+        assert wait_until(lambda: len(sim.frames('rx', protocol.MSG_PING)) >= 3, 1.0)
+        wire = sim.frames('rx', protocol.MSG_PING)
+        # 1.2 x 0.1 s between sends; without the factor they come 0.1 s apart.
+        assert all(b.time - a.time >= 0.115 for a, b in zip(wire, wire[1:]))
+    finally:
+        h.stop()
