@@ -141,7 +141,13 @@ static void tx_start_next(void)
     DMA1_Channel4->MADDR = (uint32_t)(uintptr_t)slot->data;
     DMA1_Channel4->CNTR = slot->len;
     USART_ClearFlag(USART1, USART_FLAG_TC);
+#if BMCU_RS485_DE
+    // PA12 enables the RS485 driver for this frame; bmcu_uart_poll drops it
+    // once TC confirms the last stop bit has left the shifter.
+    GPIOA->BSHR = GPIO_Pin_12;
+#else
     GPIOA->BCR = GPIO_Pin_12;
+#endif
     tx_busy = 1u;
     tx_started_tick = time_ticks32();
     DMA_Cmd(DMA1_Channel4, ENABLE);
