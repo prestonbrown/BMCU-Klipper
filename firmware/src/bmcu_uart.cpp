@@ -119,9 +119,55 @@ static void tx_pop_active(void)
     }
 }
 
+#if BMCU_RS485_DE
+#define BMCU_RS485_QUIET_MS 1u
+#define BMCU_RS485_HOLD_MAX_MS 20u
+
+static uint32_t rx_seen_count = 0u;
+static uint32_t rx_seen_tick = 0u;
+static uint32_t tx_hold_since = 0u;
+static uint8_t tx_holding = 0u;
+
+// The host and the BMCU share one RS485 pair, so a frame is only started once the
+// line has been quiet for BMCU_RS485_QUIET_MS. Continuous noise cannot hold TX off
+// for longer than BMCU_RS485_HOLD_MAX_MS.
+static bool rs485_hold_tx(void)
+{
+    uint32_t ticks_per_ms = time_hw_tpms;
+    if (!ticks_per_ms) ticks_per_ms = 1u;
+    const uint32_t now = time_ticks32();
+    const uint32_t count = rx_produced();
+    if (count != rx_seen_count)
+    {
+        rx_seen_count = count;
+        rx_seen_tick = now;
+    }
+    if ((uint32_t)(now - rx_seen_tick) >= ticks_per_ms * BMCU_RS485_QUIET_MS)
+    {
+        tx_holding = 0u;
+        return false;
+    }
+    if (!tx_holding)
+    {
+        tx_holding = 1u;
+        tx_hold_since = now;
+    }
+    if ((uint32_t)(now - tx_hold_since) >= ticks_per_ms * BMCU_RS485_HOLD_MAX_MS)
+    {
+        tx_holding = 0u;
+        return false;
+    }
+    return true;
+}
+#endif
+
 static void tx_start_next(void)
 {
     if (tx_busy || tx_wait_tc) return;
+#if BMCU_RS485_DE
+    if (!tx_critical_count && !tx_normal_count) return;
+    if (rs485_hold_tx()) return;
+#endif
 
     TxSlot *slot = 0;
     if (tx_critical_count)
