@@ -774,6 +774,23 @@ static uint32_t distance_timeout_ms(float mm, float speed_mms, uint32_t minimum_
     return (uint32_t)estimate;
 }
 
+static void begin_op(uint32_t op_id, uint8_t type, uint8_t ch,
+                     uint32_t timeout_ms, float target_m)
+{
+    memset(&g_op, 0, sizeof(g_op));
+    g_op.active = 1u;
+    g_op.type = type;
+    g_op.ch = ch;
+    g_op.op_id = op_id;
+    g_op.started_ticks = time_ticks64();
+    g_op.deadline_ticks = g_op.started_ticks +
+                          (uint64_t)timeout_ms * (uint64_t)(time_hw_tpms ? time_hw_tpms : 1u);
+    g_op.start_meters = Motion_control_encoder_meters(ch);
+    g_op.target_meters = target_m;
+    g_last_op_state = OP_STATE_RUNNING;
+    g_last_op_reason = OP_REASON_NONE;
+}
+
 static bool start_distance_op(uint32_t op_id, uint8_t type, uint8_t ch,
                               float mm, uint32_t timeout_ms,
                               uint8_t contact_pct, bool stop_on_contact,
@@ -792,20 +809,9 @@ static bool start_distance_op(uint32_t op_id, uint8_t type, uint8_t ch,
     const bool changes_route = occupies_route;
     if (changes_route && !ams_state_begin_change(ch)) return false;
 
-    memset(&g_op, 0, sizeof(g_op));
-    g_op.active = 1u;
-    g_op.type = type;
-    g_op.ch = ch;
-    g_op.op_id = op_id;
-    g_op.started_ticks = time_ticks64();
-    g_op.deadline_ticks = g_op.started_ticks +
-                          (uint64_t)timeout_ms * (uint64_t)(time_hw_tpms ? time_hw_tpms : 1u);
-    g_op.start_meters = Motion_control_encoder_meters(ch);
-    g_op.target_meters = mm / 1000.0f;
+    begin_op(op_id, type, ch, timeout_ms, mm / 1000.0f);
     g_op.contact_pct = contact_pct;
     g_op.stop_on_contact = stop_on_contact ? 1u : 0u;
-    g_last_op_state = OP_STATE_RUNNING;
-    g_last_op_reason = OP_REASON_NONE;
 
     if (!set_motion(ch, _filament_motion::send_out, false))
     {
@@ -826,19 +832,7 @@ static bool start_channel_retract_op(uint32_t op_id, uint8_t ch)
         !Motion_control_encoder_io_ok(ch))
         return false;
 
-    memset(&g_op, 0, sizeof(g_op));
-    g_op.active = 1u;
-    g_op.type = OP_CHANNEL_RETRACT;
-    g_op.ch = ch;
-    g_op.op_id = op_id;
-    g_op.started_ticks = time_ticks64();
-    g_op.deadline_ticks = g_op.started_ticks +
-        (uint64_t)300000u *
-        (uint64_t)(time_hw_tpms ? time_hw_tpms : 1u);
-    g_op.start_meters = Motion_control_encoder_meters(ch);
-    g_op.target_meters = 5.0f;
-    g_last_op_state = OP_STATE_RUNNING;
-    g_last_op_reason = OP_REASON_NONE;
+    begin_op(op_id, OP_CHANNEL_RETRACT, ch, 300000u, 5.0f);
     if (!Motion_control_start_channel_retract(ch))
     {
         g_op.active = 0u;
@@ -859,17 +853,7 @@ static uint8_t start_tail_retract_op(uint32_t op_id, uint8_t ch,
         !Motion_control_start_tail_retract(ch, target_m))
         return OP_REASON_BUSY;
 
-    memset(&g_op, 0, sizeof(g_op));
-    g_op.active = 1u;
-    g_op.type = OP_TAIL_RETRACT;
-    g_op.ch = ch;
-    g_op.op_id = op_id;
-    g_op.started_ticks = time_ticks64();
-    g_op.deadline_ticks = deadline_ticks_after_ms(timeout_ms);
-    g_op.start_meters = Motion_control_encoder_meters(ch);
-    g_op.target_meters = target_m;
-    g_last_op_state = OP_STATE_RUNNING;
-    g_last_op_reason = OP_REASON_NONE;
+    begin_op(op_id, OP_TAIL_RETRACT, ch, timeout_ms, target_m);
     return OP_REASON_NONE;
 }
 
@@ -878,10 +862,7 @@ static void release_op_motion(void)
     if (g_op.type == OP_CHANNEL_RETRACT)
         Motion_control_cancel_channel_retract(g_op.ch);
     else if (g_op.type == OP_TAIL_RETRACT)
-    {
         Motion_control_stop_channel_motion(g_op.ch);
-        (void)ams_state_set_unloaded(g_op.ch);
-    }
 }
 
 static void finish_distance_op(uint8_t state, uint8_t reason)
@@ -935,8 +916,8 @@ static void process_distance_op(void)
 {
     if (!g_op.active) return;
     const uint64_t now_ticks64 = time_ticks64();
-    const float measured = fabsf(
-        Motion_control_encoder_meters(g_op.ch) - g_op.start_meters);
+    const float pulled = g_op.start_meters - Motion_control_encoder_meters(g_op.ch);
+    const float measured = fabsf(pulled);
 
     if (g_op.type == OP_CHANNEL_RETRACT)
     {
@@ -975,8 +956,11 @@ static void process_distance_op(void)
             reason = OP_REASON_ENCODER_IO;
         else if (MC_PULL_pct[g_op.ch] < 5u)
             reason = OP_REASON_BUFFER_LIMIT;
-        else if (measured >= g_op.target_meters)
+        else if (pulled >= g_op.target_meters)
         {
+            // Only a completed pull clears the route; a failed or aborted one
+            // may leave filament held downstream.
+            (void)ams_state_set_unloaded(g_op.ch);
             finish_distance_op(OP_STATE_DONE, OP_REASON_TARGET);
             return;
         }
@@ -1524,8 +1508,10 @@ static void handle_packet(const uint8_t *data, uint16_t len)
             uint32_t timeout_ms = 0u;
             memcpy(&mm, payload + 1, sizeof(float));
             memcpy(&timeout_ms, payload + 5, sizeof(uint32_t));
-            // Written so a NaN fails the range test.
-            if (payload[0] >= 4u || !(mm >= 5.0f && mm <= 2000.0f))
+            // Written so a NaN fails the range test; the timeout bounds pull
+            // mode, which has no stall stop of its own.
+            if (payload[0] >= 4u || !(mm >= 5.0f && mm <= 2000.0f) ||
+                timeout_ms - 250u > 299750u)
             {
                 send_error(header.cmd_id, 0xFFu, 31u);
                 break;

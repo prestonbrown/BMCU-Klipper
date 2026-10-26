@@ -3174,6 +3174,7 @@ static void motor_motion_run(int error, uint64_t time_now, uint32_t now_ticks,
 
         if (!MC_PULL_calibration_is_valid(i))
         {
+            g_tail_retract_active[i] = 0u;
             if (auto_unload_active[i])
                 Motion_control_cancel_channel_retract(i);
             else

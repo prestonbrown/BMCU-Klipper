@@ -154,6 +154,20 @@ def test_tail_retract_rejects_short_distance(sim, channel, millimeters):
     assert sim.meters == [0.0] * 4
 
 
+@pytest.mark.parametrize('timeout_ms', [0, 249, 300001, 0xffffffff])
+def test_tail_retract_rejects_timeout_out_of_range(sim, timeout_ms):
+    raw_tail_retract(sim, 1, 73, 0, 300.0, timeout_ms)
+    assert sim.wait_for(lambda: sent_errors(sim, 73)) == [31]
+    assert sim.operations_started == []
+
+
+def test_tail_retract_accepts_timeout_bounds(sim):
+    raw_tail_retract(sim, 1, 74, 0, 5.0, 250)
+    assert sim.wait_for(lambda: sim.operations[74]['result'] is not None)
+    raw_tail_retract(sim, 2, 75, 1, 5.0, 300000)
+    assert sim.operations_started == [74, 75]
+
+
 def test_tail_retract_accepts_distance_bounds(sim):
     raw_tail_retract(sim, 1, 71, 0, 5.0)
     assert sim.wait_for(lambda: sim.operations[71]['result'] is not None)
@@ -182,6 +196,7 @@ def test_tail_retract_refused_while_channel_moving(sim, device):
 
 def test_tail_retract_stop_all_aborts(sim, device):
     sim.pull_speed_mms = 50.0
+    sim.route[3] = protocol.ROUTE_LOADED
     op_id = device.start_tail_retract(3, 300.0, 20000)
     assert sim.wait_for(lambda: sim.meters[3] < -0.005)
     device.stop_all()
@@ -191,35 +206,51 @@ def test_tail_retract_stop_all_aborts(sim, device):
     stopped_at = sim.meters[3]
     time.sleep(0.1)
     assert sim.meters[3] == stopped_at > -0.300
+    assert sim.route[3] == protocol.ROUTE_LOADED
 
 
 def test_tail_retract_abort_op_aborts(sim, device):
     sim.pull_speed_mms = 50.0
+    sim.route[0] = protocol.ROUTE_UNCERTAIN
     op_id = device.start_tail_retract(0, 300.0, 20000)
     assert sim.wait_for(lambda: sim.meters[0] < -0.005)
     device.abort_operation()
     result = device.wait_for_op(op_id, timeout=2.0)
     assert (result['state'], result['reason']) == (protocol.OP_STATE_ABORTED, 'aborted')
     assert sim.motion[0] == protocol.MOTION_IDLE
+    assert sim.route[0] == protocol.ROUTE_UNCERTAIN
 
 
 def test_tail_retract_timeout_fails(sim, device):
     sim.pull_speed_mms = 50.0
+    sim.route[1] = protocol.ROUTE_LOADED
     op_id = device.start_tail_retract(1, 300.0, 300)
     result = device.wait_for_op(op_id, timeout=3.0)
     assert (result['state'], result['reason']) == (protocol.OP_STATE_FAILED, 'timeout')
     assert -0.300 < sim.meters[1] < 0.0
-    assert sim.route[1] == protocol.ROUTE_EMPTY
+    assert sim.route[1] == protocol.ROUTE_LOADED
 
 
 def test_tail_retract_buffer_limit_fails(sim, device):
     sim.pull_speed_mms = 50.0
+    sim.route[1] = protocol.ROUTE_LOADED
     op_id = device.start_tail_retract(1, 300.0, 20000)
     assert sim.wait_for(lambda: sim.meters[1] < -0.005)
     sim.buffer_pct[1] = 3
     result = device.wait_for_op(op_id, timeout=2.0)
     assert (result['state'], result['reason']) == (protocol.OP_STATE_FAILED,
                                                    'buffer_limit')
+    assert sim.route[1] == protocol.ROUTE_LOADED
+
+
+def test_tail_retract_forward_motion_never_reports_done(sim, device):
+    sim.pull_direction = 1.0
+    sim.route[2] = protocol.ROUTE_LOADED
+    op_id = device.start_tail_retract(2, 5.0, 300)
+    result = device.wait_for_op(op_id, timeout=3.0)
+    assert (result['state'], result['reason']) == (protocol.OP_STATE_FAILED, 'timeout')
+    assert sim.meters[2] > 0.0
+    assert sim.route[2] == protocol.ROUTE_LOADED
 
 
 def test_tail_retract_replays_op_id(sim, device):

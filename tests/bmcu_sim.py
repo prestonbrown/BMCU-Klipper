@@ -143,6 +143,8 @@ class BmcuSim(object):
         # Encoder position per channel in meters; pulling back decreases it.
         self.meters = [0.0] * 4
         self.pull_speed_mms = 2000.0
+        # -1 pulls back; +1 models an encoder that reads the motion as forward.
+        self.pull_direction = -1.0
         self.error_flags = 0
         # op_id -> {'type', 'channel', 'result'}; op_id is the request cmd_id.
         self.operations = {}
@@ -466,7 +468,8 @@ class BmcuSim(object):
             if operation is not None:
                 return self._on_operation(protocol.OP_TAIL_RETRACT, cmd_id, payload)
             channel, millimeters, timeout_ms = _TAIL_RETRACT.unpack(payload)
-            if channel >= 4 or not 5.0 <= millimeters <= 2000.0:
+            if (channel >= 4 or not 5.0 <= millimeters <= 2000.0 or
+                    not 250 <= timeout_ms <= 300000):
                 return [error_reply(cmd_id, 31)]
             reason = None
             if not self.calibrated[channel]:
@@ -509,9 +512,11 @@ class BmcuSim(object):
                 if operation['result'] is not None or 'target_mm' not in operation:
                     continue
                 channel = operation['channel']
-                pulled_mm = min(operation['target_mm'],
-                                (now - operation['started']) * self.pull_speed_mms)
-                self.meters[channel] = operation['start_m'] - pulled_mm / 1000.0
+                moved_mm = min(operation['target_mm'],
+                               (now - operation['started']) * self.pull_speed_mms)
+                self.meters[channel] = (operation['start_m'] +
+                                        self.pull_direction * moved_mm / 1000.0)
+                pulled_mm = (operation['start_m'] - self.meters[channel]) * 1000.0
                 if self.buffer_pct[channel] < 5:
                     outcome = (protocol.OP_STATE_FAILED, REASON_BUFFER_LIMIT)
                 elif pulled_mm >= operation['target_mm']:
@@ -534,7 +539,8 @@ class BmcuSim(object):
         operation['result'] = _OP_RESULT.pack(
             op_id, protocol.OP_TAIL_RETRACT, channel, state, reason,
             operation['target_mm'], measured_mm, duration_ms)
-        self.route[channel] = protocol.ROUTE_EMPTY
+        if state == protocol.OP_STATE_DONE:
+            self.route[channel] = protocol.ROUTE_EMPTY
         self.event_counter += 1
 
     def _on_set_motion(self, cmd_id, payload):
