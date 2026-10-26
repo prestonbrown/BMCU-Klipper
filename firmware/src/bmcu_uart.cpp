@@ -122,15 +122,18 @@ static void tx_pop_active(void)
 #if BMCU_RS485_DE
 #define BMCU_RS485_QUIET_MS 1u
 #define BMCU_RS485_HOLD_MAX_MS 20u
+#define BMCU_RS485_HOLD_ABS_MAX_MS 150u
 
 static uint32_t rx_seen_count = 0u;
 static uint32_t rx_seen_tick = 0u;
 static uint32_t tx_hold_since = 0u;
+static uint32_t tx_hold_first = 0u;
 static uint8_t tx_holding = 0u;
 
 // The host and the BMCU share one RS485 pair, so a frame is only started once the
-// line has been quiet for BMCU_RS485_QUIET_MS. Noise without frame delimiters
-// cannot hold TX off for longer than BMCU_RS485_HOLD_MAX_MS.
+// line has been quiet for BMCU_RS485_QUIET_MS. Each received frame delimiter
+// restarts the BMCU_RS485_HOLD_MAX_MS cap, and BMCU_RS485_HOLD_ABS_MAX_MS bounds
+// the whole hold, so noise that decodes as 0x00 cannot starve TX.
 static bool rs485_hold_tx(void)
 {
     uint32_t ticks_per_ms = time_hw_tpms;
@@ -164,8 +167,10 @@ static bool rs485_hold_tx(void)
     {
         tx_holding = 1u;
         tx_hold_since = now;
+        tx_hold_first = now;
     }
-    if ((uint32_t)(now - tx_hold_since) >= ticks_per_ms * BMCU_RS485_HOLD_MAX_MS)
+    if ((uint32_t)(now - tx_hold_since) >= ticks_per_ms * BMCU_RS485_HOLD_MAX_MS ||
+        (uint32_t)(now - tx_hold_first) >= ticks_per_ms * BMCU_RS485_HOLD_ABS_MAX_MS)
     {
         tx_holding = 0u;
         return false;
