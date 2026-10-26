@@ -66,6 +66,11 @@ _PASSIVE_TYPES = frozenset((
 # Half-duplex writes wait at most this long for a partial inbound frame to
 # finish, so line noise cannot hold transmit forever.
 _WRITE_GATE_MAX = 0.05
+# How long a half-duplex daemon remembers that a plain request was answered,
+# so a late duplicate reply (to the original and to its resend) is dropped
+# instead of reaching Klipper as an unsolicited packet.
+_ANSWERED_TTL = 5.0
+_MAX_ANSWERED = 4096
 # Each resend wait is resend_timeout scaled by a factor drawn from this range,
 # so host retries cannot phase-lock with the firmware's periodic STATUS.
 _RESEND_JITTER = (0.8, 1.2)
@@ -145,6 +150,7 @@ class TransportDaemon(object):
         self.partial_since = 0.0
         self.last_rx_byte = 0.0
         self.resend = {}
+        self.answered = {}
         self.next_serial_connect = 0.0
         self.last_connect_error = ''
         self.serial_settle_until = 0.0
@@ -957,10 +963,35 @@ class TransportDaemon(object):
         if command == transport.CTRL_SNAPSHOT and self.session_ready and self.serial is not None:
             self._queue_internal(protocol.MSG_GET_SNAPSHOT, b'', 'snapshot')
 
+    def _awaiting_reply(self, cmd_id):
+        return cmd_id in self.internal_pending or cmd_id in self.external_pending
+
     def _handle_serial_packet(self, msg_type, seq, cmd_id, payload):
-        self.last_serial_rx = time.monotonic()
+        now = time.monotonic()
+        self.last_serial_rx = now
         if msg_type & 0x80:
             self.resend.pop(cmd_id, None)
+        if not (self.args.half_duplex and msg_type & 0x80 and cmd_id):
+            self._dispatch_serial_packet(msg_type, seq, cmd_id, payload)
+            return
+        if self.answered.get(cmd_id, 0.0) > now:
+            logging.info('dropped duplicate reply 0x%02X cmd=%d', msg_type, cmd_id)
+            return
+        # A request whose record a reply retired is answered; an operation
+        # keeps its record until it completes and dedupes its own replies.
+        awaiting = self._awaiting_reply(cmd_id)
+        self._dispatch_serial_packet(msg_type, seq, cmd_id, payload)
+        if awaiting and not self._awaiting_reply(cmd_id):
+            if len(self.answered) >= _MAX_ANSWERED:
+                self._expire_answered(float('inf'))
+            self.answered[cmd_id] = now + _ANSWERED_TTL
+
+    def _expire_answered(self, now):
+        for cmd_id, expiry in list(self.answered.items()):
+            if expiry <= now:
+                del self.answered[cmd_id]
+
+    def _dispatch_serial_packet(self, msg_type, seq, cmd_id, payload):
         purpose = self.internal_pending.get(cmd_id)
         if purpose == 'hello' and msg_type == protocol.MSG_HELLO_ACK:
             hello = protocol.parse_hello(payload)
@@ -1269,6 +1300,8 @@ class TransportDaemon(object):
                     self._service_resends(now)
                 except Exception as exc:
                     self._close_serial(str(exc))
+        if self.answered:
+            self._expire_answered(now)
         if self.external_pending:
             expired = [wire for wire, value in self.external_pending.items()
                        if value.get('deadline', 0.0) <= now]

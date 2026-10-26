@@ -1138,3 +1138,53 @@ def test_half_duplex_update_prepare_drops_the_update_cancel_resend(start, sim):
     cancel = sim.frames('rx', protocol.MSG_UPDATE_CANCEL)[0]
     prepare = sim.frames('rx', protocol.MSG_UPDATE_PREPARE)[0]
     assert prepare.time > cancel.time
+
+
+def test_half_duplex_duplicate_reply_to_a_plain_request_is_dropped(start, sim):
+    h = start_half_duplex(start)
+    client = h.connect()
+    h.wait_ready()
+    client.send(protocol.MSG_FEED_DISTANCE, 520, FEED)
+    assert wait_until(lambda: client.packets(protocol.MSG_ACK, 520))
+    # The operation is still running, so the query reaches the BMCU, which
+    # answers it twice: the delayed original and the resend.
+    sim.add_fault('delay', protocol.MSG_GET_OP_RESULT, seconds=0.2)
+    client.send(protocol.MSG_GET_OP_RESULT, 521, struct.pack('<I', 520))
+    assert wait_until(lambda: len(sim.frames('tx', protocol.MSG_ERROR)) >= 2, 1.0)
+    client.send(protocol.MSG_PING, 522, b'sync')
+    assert wait_until(lambda: client.packets(protocol.MSG_PONG, 522))
+    assert len(client.packets(protocol.MSG_ERROR, 521)) == 1
+    assert not client.packets(protocol.MSG_ERROR, 0)
+
+
+def test_half_duplex_answered_ids_expire(start, sim, monkeypatch):
+    monkeypatch.setattr(bmcu_transportd, '_ANSWERED_TTL', 0.2)
+    h = start_half_duplex(start)
+    client = h.connect()
+    h.wait_ready()
+    client.send(protocol.MSG_PING, 523, b'e')
+    assert wait_until(lambda: client.packets(protocol.MSG_PONG, 523))
+    assert h.daemon.answered
+    assert wait_until(lambda: not h.daemon.answered, 1.0)
+
+
+def test_full_duplex_keeps_no_answered_ids(start, sim):
+    h = start()
+    client = h.connect()
+    h.wait_ready()
+    client.send(protocol.MSG_PING, 524, b'f')
+    assert wait_until(lambda: client.packets(protocol.MSG_PONG, 524))
+    assert not h.daemon.answered
+
+
+def test_half_duplex_duplicate_error_to_an_operation_is_dropped(start, sim):
+    h = start_half_duplex(start)
+    client = h.connect()
+    h.wait_ready()
+    sim.add_fault('delay', protocol.MSG_FEED_DISTANCE, seconds=0.2)
+    client.send(protocol.MSG_FEED_DISTANCE, 525, struct.pack('<BfBI', 7, 100.0, 0, 5000))
+    assert wait_until(lambda: len(sim.frames('tx', protocol.MSG_ERROR)) >= 2, 1.0)
+    client.send(protocol.MSG_PING, 526, b'sync')
+    assert wait_until(lambda: client.packets(protocol.MSG_PONG, 526))
+    assert len(client.packets(protocol.MSG_ERROR, 525)) == 1
+    assert not client.packets(protocol.MSG_ERROR, 0)

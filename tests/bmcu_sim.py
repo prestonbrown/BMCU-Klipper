@@ -105,6 +105,7 @@ class BmcuSim(object):
             protocol.MSG_ABORT_OP: self._on_abort,
             protocol.MSG_STOP_ALL: self._on_stop_all,
             protocol.MSG_UPDATE_PREPARE: self._on_ack,
+            protocol.MSG_GET_OP_RESULT: self._on_get_op_result,
             protocol.MSG_SET_MOTION: self._on_set_motion,
             protocol.MSG_MARK_LOADED: self._on_ack,
             protocol.MSG_MARK_UNLOADED: self._on_ack,
@@ -411,6 +412,12 @@ class BmcuSim(object):
                     protocol.OP_STATE_ABORTED, 6, 100.0, 0.0, 0)
                 results.append((protocol.MSG_OP_RESULT, op_id, operation['result']))
         return results
+
+    def _on_get_op_result(self, cmd_id, payload):
+        operation = self.operations.get(struct.unpack('<I', payload)[0])
+        if operation is None or operation['result'] is None:
+            return [error_reply(cmd_id, 22)]
+        return [(protocol.MSG_OP_RESULT, cmd_id, operation['result'])]
 
     def _on_stop_all(self, cmd_id, _payload):
         # stop_all_motion(): every channel idle, running operations aborted.
