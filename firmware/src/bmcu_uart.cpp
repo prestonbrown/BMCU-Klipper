@@ -129,8 +129,8 @@ static uint32_t tx_hold_since = 0u;
 static uint8_t tx_holding = 0u;
 
 // The host and the BMCU share one RS485 pair, so a frame is only started once the
-// line has been quiet for BMCU_RS485_QUIET_MS. Continuous noise cannot hold TX off
-// for longer than BMCU_RS485_HOLD_MAX_MS.
+// line has been quiet for BMCU_RS485_QUIET_MS. Noise without frame delimiters
+// cannot hold TX off for longer than BMCU_RS485_HOLD_MAX_MS.
 static bool rs485_hold_tx(void)
 {
     uint32_t ticks_per_ms = time_hw_tpms;
@@ -139,6 +139,19 @@ static bool rs485_hold_tx(void)
     const uint32_t count = rx_produced();
     if (count != rx_seen_count)
     {
+        // A delimiter starts a new host frame, so the hold cap applies per frame
+        // and a multi-frame host write is not interrupted at the cap.
+        if (tx_holding && (uint32_t)(count - rx_seen_count) <= BMCU_UART_RX_SIZE)
+        {
+            for (uint32_t i = rx_seen_count; i != count; i++)
+            {
+                if (rx_dma_buf[i & BMCU_UART_RX_MASK] == 0u)
+                {
+                    tx_hold_since = now;
+                    break;
+                }
+            }
+        }
         rx_seen_count = count;
         rx_seen_tick = now;
     }
@@ -158,6 +171,29 @@ static bool rs485_hold_tx(void)
         return false;
     }
     return true;
+}
+
+// DMA completion arms the USART transmit-complete interrupt, which drops PA12 as
+// soon as the last stop bit has left the shifter instead of at the next poll.
+// The DMA and TC flags stay set for bmcu_uart_poll's bookkeeping.
+extern "C" void DMA1_Channel4_IRQHandler(void) __attribute__((interrupt("WCH-Interrupt-fast")));
+void DMA1_Channel4_IRQHandler(void)
+{
+    if (DMA1->INTFR & DMA1_FLAG_TC4)
+    {
+        DMA_ITConfig(DMA1_Channel4, DMA_IT_TC, DISABLE);
+        USART1->CTLR1 |= USART_CTLR1_TCIE;
+    }
+}
+
+extern "C" void USART1_IRQHandler(void) __attribute__((interrupt("WCH-Interrupt-fast")));
+void USART1_IRQHandler(void)
+{
+    if ((USART1->CTLR1 & USART_CTLR1_TCIE) && (USART1->STATR & USART_FLAG_TC))
+    {
+        USART1->CTLR1 &= (uint16_t)~USART_CTLR1_TCIE;
+        GPIOA->BCR = GPIO_Pin_12;
+    }
 }
 #endif
 
@@ -188,8 +224,10 @@ static void tx_start_next(void)
     DMA1_Channel4->CNTR = slot->len;
     USART_ClearFlag(USART1, USART_FLAG_TC);
 #if BMCU_RS485_DE
-    // PA12 enables the RS485 driver for this frame; bmcu_uart_poll drops it
-    // once TC confirms the last stop bit has left the shifter.
+    // PA12 enables the RS485 driver for this frame; USART1_IRQHandler drops it
+    // at transmit complete, as do bmcu_uart_poll's error and timeout paths.
+    USART1->CTLR1 &= (uint16_t)~USART_CTLR1_TCIE;
+    DMA_ITConfig(DMA1_Channel4, DMA_IT_TC, ENABLE);
     GPIOA->BSHR = GPIO_Pin_12;
 #else
     GPIOA->BCR = GPIO_Pin_12;
@@ -270,6 +308,12 @@ void bmcu_uart_init(uint32_t baud)
     DMA_Init(DMA1_Channel4, &dma);
     DMA_Cmd(DMA1_Channel4, DISABLE);
     DMA_ClearFlag(DMA1_FLAG_GL4 | DMA1_FLAG_TC4 | DMA1_FLAG_HT4 | DMA1_FLAG_TE4);
+#if BMCU_RS485_DE
+    nvic.NVIC_IRQChannel = DMA1_Channel4_IRQn;
+    NVIC_Init(&nvic);
+    nvic.NVIC_IRQChannel = USART1_IRQn;
+    NVIC_Init(&nvic);
+#endif
 
     USART1->CTLR3 |= USART_DMAReq_Rx | USART_DMAReq_Tx;
     USART_Cmd(USART1, ENABLE);
@@ -350,6 +394,9 @@ bool bmcu_uart_write(const uint8_t *data, uint16_t len, bool critical)
 
 void bmcu_uart_discard_pending(void)
 {
+#if BMCU_RS485_DE
+    tx_holding = 0u;
+#endif
     const bool active = tx_busy || tx_wait_tc;
     if (!active)
     {
