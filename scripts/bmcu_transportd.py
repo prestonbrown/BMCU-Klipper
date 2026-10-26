@@ -50,7 +50,8 @@ _RESEND_PURPOSES = frozenset(('confirm', 'resume_update', 'snapshot'))
 _NO_RESEND_TYPES = frozenset((protocol.MSG_CHANNEL_PRELOAD,))
 # A late resend must never run after a newer command and undo it. Queuing one
 # of these stop/reset requests drops every pending resend; queuing any other
-# state-changing request drops the pending resends of state-changing requests.
+# state-changing request drops the pending resends of state-changing requests
+# other than stops, which only a newer stop supersedes.
 _STOP_TYPES = frozenset((
     protocol.MSG_STOP_ALL, protocol.MSG_ABORT_OP, protocol.MSG_RESET_ERROR,
     protocol.MSG_UPDATE_PREPARE,
@@ -62,6 +63,13 @@ _PASSIVE_TYPES = frozenset((
     protocol.MSG_GET_CALIBRATION, protocol.MSG_GET_OP_RESULT,
     protocol.MSG_GET_SLOT_INFO, protocol.MSG_CONFIG_GET, protocol.MSG_NVM_READ,
     protocol.MSG_GET_SNAPSHOT, protocol.MSG_HELLO, protocol.MSG_SESSION_CONFIRM,
+))
+# Unsolicited (cmd 0) firmware events that report a stop or fault. They make
+# pending resends stale the way a newer host state change does: a resent
+# SET_MOTION would otherwise restart a motor the firmware just stopped.
+_FIRMWARE_STOP_EVENTS = frozenset((
+    protocol.MSG_JAM, protocol.MSG_STATE_CHANGED, protocol.MSG_MOTION_DONE,
+    protocol.MSG_ERROR,
 ))
 # Half-duplex writes wait at most this long for a partial inbound frame to
 # finish, so line noise cannot hold transmit forever.
@@ -357,11 +365,19 @@ class TransportDaemon(object):
         }
 
     def _drop_superseded_resends(self, msg_type):
+        """Drops resends by request kind, not by channel: a state change on
+        one channel also drops a pending resend for another channel, which
+        then simply times out."""
         if msg_type in _PASSIVE_TYPES:
             return
         for cmd_id, entry in list(self.resend.items()):
-            if (msg_type in _STOP_TYPES or
-                    entry['msg_type'] not in _PASSIVE_TYPES):
+            pending = entry['msg_type']
+            if msg_type in _STOP_TYPES:
+                stale = True
+            else:
+                stale = (pending not in _PASSIVE_TYPES and
+                         pending not in _STOP_TYPES)
+            if stale:
                 self.resend.pop(cmd_id)
                 logging.info('dropped resend of 0x%02X cmd=%d: superseded by 0x%02X',
                              entry['msg_type'], cmd_id, msg_type)
@@ -971,6 +987,8 @@ class TransportDaemon(object):
         self.last_serial_rx = now
         if msg_type & 0x80:
             self.resend.pop(cmd_id, None)
+        if not cmd_id and msg_type in _FIRMWARE_STOP_EVENTS and self.resend:
+            self._drop_superseded_resends(msg_type)
         if not (self.args.half_duplex and msg_type & 0x80 and cmd_id):
             self._dispatch_serial_packet(msg_type, seq, cmd_id, payload)
             return

@@ -1059,17 +1059,19 @@ def test_half_duplex_lost_motion_is_not_resent_after_stop_all(start, sim):
     assert not client.packets(protocol.MSG_ACK, 500)
 
 
-def test_half_duplex_lost_stop_all_is_not_resent_after_a_newer_operation(start, sim):
+def test_half_duplex_lost_stop_all_is_still_resent_after_a_newer_operation(start, sim):
     h = start_half_duplex(start)
     client = h.connect()
     h.wait_ready()
     sim.add_fault('ignore', protocol.MSG_STOP_ALL)
     client.send(protocol.MSG_STOP_ALL, 502)
     client.send(protocol.MSG_FEED_DISTANCE, 503, FEED)
-    assert wait_until(lambda: client.packets(protocol.MSG_ACK, 503))
-    time.sleep(0.4)
-    assert len(sim.frames('rx', protocol.MSG_STOP_ALL)) == 1
-    assert not client.packets(protocol.MSG_OP_RESULT, 503)
+    assert wait_until(lambda: client.packets(protocol.MSG_ACK, 502))
+    assert len(sim.frames('rx', protocol.MSG_STOP_ALL)) == 2
+    # The stop lands after the operation, so the operation is aborted.
+    result = wait_until(lambda: client.packets(protocol.MSG_OP_RESULT, 503))
+    assert result and protocol.parse_op_result(result[0][4])['state'] == \
+        protocol.OP_STATE_ABORTED
 
 
 def test_half_duplex_lost_stop_all_alone_is_resent(start, sim):
@@ -1191,3 +1193,105 @@ def test_half_duplex_duplicate_error_to_an_operation_is_dropped(start, sim):
     assert wait_until(lambda: client.packets(protocol.MSG_PONG, 526))
     assert len(client.packets(protocol.MSG_ERROR, 525)) == 1
     assert not client.packets(protocol.MSG_ERROR, 0)
+
+
+def test_half_duplex_newer_stop_drops_an_older_stop_resend(start, sim):
+    h = start_half_duplex(start)
+    client = h.connect()
+    h.wait_ready()
+    sim.add_fault('ignore', protocol.MSG_STOP_ALL)
+    client.send(protocol.MSG_STOP_ALL, 530)
+    client.send(protocol.MSG_ABORT_OP, 531)
+    assert wait_until(lambda: client.packets(protocol.MSG_ACK, 531))
+    time.sleep(0.4)
+    assert len(sim.frames('rx', protocol.MSG_STOP_ALL)) == 1
+
+
+def test_half_duplex_update_prepare_drops_an_abort_resend(start, sim):
+    h = start_half_duplex(start)
+    client = h.connect()
+    h.wait_ready()
+    sim.add_fault('ignore', protocol.MSG_ABORT_OP)
+    client.send(protocol.MSG_ABORT_OP, 532)
+    client.send(protocol.MSG_UPDATE_PREPARE, 533)
+    assert wait_until(lambda: client.packets(protocol.MSG_ACK, 533))
+    time.sleep(0.4)
+    assert len(sim.frames('rx', protocol.MSG_ABORT_OP)) == 1
+
+
+def test_half_duplex_stop_drops_a_read_resend(start, sim):
+    h = start_half_duplex(start)
+    client = h.connect()
+    h.wait_ready()
+    sim.add_fault('ignore', protocol.MSG_GET_STATUS)
+    client.send(protocol.MSG_GET_STATUS, 534)
+    client.send(protocol.MSG_STOP_ALL, 535)
+    assert wait_until(lambda: client.packets(protocol.MSG_ACK, 535))
+    time.sleep(0.4)
+    assert len(sim.frames('rx', protocol.MSG_GET_STATUS)) == 1
+
+
+def test_half_duplex_stop_resend_keeps_a_newer_read_resend(start, sim):
+    h = start_half_duplex(start)
+    client = h.connect()
+    h.wait_ready()
+    sim.add_fault('ignore', protocol.MSG_STOP_ALL)
+    sim.add_fault('ignore', protocol.MSG_GET_STATUS)
+    client.send(protocol.MSG_STOP_ALL, 536)
+    client.send(protocol.MSG_GET_STATUS, 537)
+    assert wait_until(lambda: client.packets(protocol.MSG_ACK, 536) and
+                      client.packets(protocol.MSG_STATUS, 537))
+
+
+@pytest.mark.parametrize('event,payload', [
+    (protocol.MSG_STATE_CHANGED, b'\x01'),
+    (protocol.MSG_MOTION_DONE, b'\x01'),
+    (protocol.MSG_JAM, b'\x01\x00\x00'),
+    (protocol.MSG_ERROR, struct.pack('<BHI', 1, 50, 0)),
+])
+def test_half_duplex_firmware_stop_event_drops_a_motion_resend(start, sim, event, payload):
+    h = start_half_duplex(start, resend_timeout=0.4)
+    client = h.connect()
+    h.wait_ready()
+    sim.add_fault('drop', protocol.MSG_SET_MOTION)
+    client.send(protocol.MSG_SET_MOTION, 540, bytes([1, protocol.MOTION_SEND_OUT]))
+    assert wait_until(lambda: motion_frames(sim))
+    sim.send(event, 0, payload)
+    time.sleep(0.7)
+    assert len(motion_frames(sim)) == 1
+
+
+def test_half_duplex_firmware_stop_event_keeps_a_read_resend(start, sim):
+    h = start_half_duplex(start, resend_timeout=0.4)
+    client = h.connect()
+    h.wait_ready()
+    sim.add_fault('ignore', protocol.MSG_GET_STATUS)
+    client.send(protocol.MSG_GET_STATUS, 541)
+    assert wait_until(lambda: sim.frames('rx', protocol.MSG_GET_STATUS))
+    sim.send(protocol.MSG_STATE_CHANGED, 0, b'\x01')
+    assert wait_until(lambda: client.packets(protocol.MSG_STATUS, 541), 1.5)
+
+
+def test_half_duplex_error_reply_to_a_read_keeps_a_motion_resend(start, sim):
+    h = start_half_duplex(start)
+    client = h.connect()
+    h.wait_ready()
+    sim.add_fault('ignore', protocol.MSG_SET_MOTION)
+    client.send(protocol.MSG_SET_MOTION, 542, bytes([2, protocol.MOTION_SEND_OUT]))
+    # An unknown CONFIG_GET key draws an ERROR carrying its own cmd_id.
+    client.send(protocol.MSG_CONFIG_GET, 543, struct.pack('<H', 0x7777))
+    assert wait_until(lambda: client.packets(protocol.MSG_ERROR, 543))
+    assert wait_until(lambda: client.packets(protocol.MSG_ACK, 542))
+
+
+def test_select_timeout_waits_out_a_partial_frame():
+    args = argparse.Namespace(half_duplex=True, resend_timeout=0.25,
+                              resend_attempts=3, rx_quiet_ms=2.0)
+    daemon = bmcu_transportd.TransportDaemon(args, random.Random(1))
+    daemon.serial = object()
+    daemon.serial_tx.extend(b'\x00\x01\x00')
+    daemon.serial_decoder.feed(b'\x00\x05\x01')
+    now = time.monotonic()
+    daemon.last_rx_byte = daemon.partial_since = now - 0.01
+    assert daemon._write_gated(now)
+    assert daemon._select_timeout(now) == pytest.approx(0.04, abs=0.002)
