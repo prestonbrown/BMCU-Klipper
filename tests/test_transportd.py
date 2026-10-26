@@ -1010,3 +1010,28 @@ def test_full_duplex_flush_writes_the_whole_queue():
         assert daemon.serial.drain() == b''.join(frames)
     finally:
         daemon.serial.close()
+
+
+def test_half_duplex_resend_timer_starts_when_the_frame_is_written():
+    args = argparse.Namespace(half_duplex=True, resend_timeout=0.25,
+                              resend_attempts=3, rx_quiet_ms=2.0)
+    daemon = bmcu_transportd.TransportDaemon(args, FixedUniform('low'))
+    daemon.serial = PipeSerial()
+    try:
+        cmd = daemon._queue_internal(protocol.MSG_GET_SNAPSHOT, b'', 'snapshot')
+        queued = len(daemon.serial_tx)
+        # Still unsent: no amount of waiting makes it due.
+        daemon._service_resends(time.monotonic() + 10.0)
+        assert len(daemon.serial_tx) == queued
+        before = time.monotonic()
+        daemon._flush_serial()
+        after = time.monotonic()
+        due = daemon.resend[cmd]['due']
+        assert before + 0.2 <= due <= after + 0.2
+        daemon._service_resends(due - 0.01)
+        assert not daemon.serial_tx
+        daemon._service_resends(due)
+        assert daemon.serial_tx and daemon.resend[cmd]['sends'] == 2
+        assert daemon.resend[cmd]['due'] is None
+    finally:
+        daemon.serial.close()

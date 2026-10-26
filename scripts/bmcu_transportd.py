@@ -329,7 +329,7 @@ class TransportDaemon(object):
             return
         self.resend[cmd_id] = {
             'msg_type': msg_type, 'payload': bytes(payload),
-            'due': time.monotonic() + self._resend_wait(), 'sends': 1,
+            'due': None, 'sends': 1,
         }
 
     def _resend_wait(self):
@@ -346,7 +346,7 @@ class TransportDaemon(object):
         """Re-send unanswered requests with the same cmd_id and a new seq;
         the firmware drops a frame whose seq does not advance."""
         for cmd_id, entry in list(self.resend.items()):
-            if now < entry['due']:
+            if entry['due'] is None or now < entry['due']:
                 continue
             if not self._resend_wanted(cmd_id):
                 self.resend.pop(cmd_id, None)
@@ -358,7 +358,7 @@ class TransportDaemon(object):
                 continue
             self._queue_serial(entry['msg_type'], cmd_id, entry['payload'])
             entry['sends'] += 1
-            entry['due'] = now + self._resend_wait()
+            entry['due'] = None
             logging.info('resent 0x%02X cmd=%d attempt %d',
                          entry['msg_type'], cmd_id, entry['sends'])
 
@@ -381,7 +381,8 @@ class TransportDaemon(object):
         if not self.args.half_duplex or self.serial is None:
             return timeout
         for entry in self.resend.values():
-            timeout = min(timeout, entry['due'] - now)
+            if entry['due'] is not None:
+                timeout = min(timeout, entry['due'] - now)
         if self.serial_tx and self._write_gated(now):
             release = self.last_rx_byte + self._rx_quiet()
             if self.serial_decoder.pending:
@@ -1168,6 +1169,14 @@ class TransportDaemon(object):
             written -= taken
             if not head[0]:
                 self.serial_tx_frames.popleft()
+                self._frame_written(head[1])
+
+    def _frame_written(self, cmd_id):
+        """Start a resend timer once its frame is on the wire, not when it
+        was queued behind a held write."""
+        entry = self.resend.get(cmd_id)
+        if entry is not None and entry['due'] is None:
+            entry['due'] = time.monotonic() + self._resend_wait()
 
     def _flush_client(self):
         if self.client is None or not self.client_tx:
