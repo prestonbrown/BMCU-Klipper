@@ -41,6 +41,7 @@ _OPERATION_START_TYPES = frozenset((
     protocol.MSG_TEST_ENCODER, protocol.MSG_CHANNEL_AUTOLOAD,
     protocol.MSG_FEED_TO_CONTACT, protocol.MSG_FEED_DISTANCE,
     protocol.MSG_CHANNEL_RETRACT, protocol.MSG_CAL_AUTO_START,
+    protocol.MSG_TAIL_RETRACT,
 ))
 # Half-duplex resend covers these internal requests; HELLO has its own retry
 # and the heartbeat its own expiry.

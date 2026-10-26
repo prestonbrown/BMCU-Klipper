@@ -458,6 +458,19 @@ def test_half_duplex_lost_operation_ack_does_not_start_a_second_operation(start,
     assert len(client.packets(protocol.MSG_ACK, 300)) == 1
 
 
+def test_half_duplex_tail_retract_result_reaches_client(start, sim):
+    h = start_half_duplex(start)
+    client = h.connect()
+    h.wait_ready()
+    client.send(protocol.MSG_TAIL_RETRACT, 303, protocol.pack_tail_retract(1, 20.0, 15000))
+    ack = wait_until(lambda: client.packets(protocol.MSG_ACK, 303))
+    assert ack and struct.unpack('<IBH', ack[0][4]) == (303, 1, 0)
+    result = wait_until(lambda: client.packets(protocol.MSG_OP_RESULT, 303), timeout=5.0)
+    assert result
+    parsed = protocol.parse_op_result(result[0][4])
+    assert (parsed['op_id'], parsed['type']) == (303, protocol.OP_TAIL_RETRACT)
+
+
 def test_half_duplex_late_operation_ack_reaches_client_once(start, sim):
     h = start_half_duplex(start)
     client = h.connect()
