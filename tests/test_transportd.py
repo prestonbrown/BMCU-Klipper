@@ -1406,3 +1406,29 @@ def test_half_duplex_falling_error_flags_keep_a_motion_resend(start, sim):
     sim.error_flags = 0
     sim.send_status()
     assert wait_until(lambda: client.packets(protocol.MSG_ACK, 556), 1.5)
+
+
+def test_half_duplex_channel_going_idle_keeps_a_read_resend(start, sim):
+    h = start_half_duplex(start, resend_timeout=0.4)
+    client = h.connect()
+    h.wait_ready()
+    sim.motion[1] = protocol.MOTION_SEND_OUT
+    sim.send_status()
+    wait_status_seen(h, sim, 1)
+    sim.add_fault('ignore', protocol.MSG_GET_STATUS)
+    client.send(protocol.MSG_GET_STATUS, 557)
+    assert wait_until(lambda: sim.frames('rx', protocol.MSG_GET_STATUS))
+    sim.motion[1] = protocol.MOTION_IDLE
+    sim.send_status()
+    assert wait_until(lambda: client.packets(protocol.MSG_STATUS, 557), 1.5)
+
+
+def test_status_tracker_resets_when_the_port_closes(tmp_path):
+    args = argparse.Namespace(half_duplex=True, resend_timeout=0.25, resend_attempts=3,
+                              rx_quiet_ms=2.0, reconnect=1.0, name='t', port='',
+                              expected_uid='', status_file=str(tmp_path / 's.json'))
+    daemon = bmcu_transportd.TransportDaemon(args, random.Random(1))
+    daemon.status_motion = (protocol.MOTION_SEND_OUT,) * 4
+    daemon.status_flags = 4
+    daemon._close_serial('test', notify=False)
+    assert daemon.status_motion is None and daemon.status_flags == 0
