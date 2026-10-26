@@ -1295,3 +1295,114 @@ def test_select_timeout_waits_out_a_partial_frame():
     daemon.last_rx_byte = daemon.partial_since = now - 0.01
     assert daemon._write_gated(now)
     assert daemon._select_timeout(now) == pytest.approx(0.04, abs=0.002)
+
+
+def lose_first_motion_ack(sim):
+    """The first SET_MOTION runs but only its STATUS(0) reaches the host."""
+    handler = sim.handlers[protocol.MSG_SET_MOTION]
+    calls = []
+
+    def lossy(cmd_id, payload):
+        replies = handler(cmd_id, payload)
+        calls.append(cmd_id)
+        if len(calls) == 1:
+            return [reply for reply in replies if reply[0] != protocol.MSG_ACK]
+        return replies
+    sim.handlers[protocol.MSG_SET_MOTION] = lossy
+
+
+def wait_status_seen(h, sim, count):
+    """Wait until the daemon has had time to process `count` sim STATUS frames."""
+    assert wait_until(lambda: len(sim.frames('tx', protocol.MSG_STATUS)) >= count)
+    assert wait_until(lambda: h.daemon.status_motion is not None)
+    time.sleep(0.05)
+
+
+def test_half_duplex_motion_start_status_keeps_its_resend(start, sim):
+    h = start_half_duplex(start, resend_timeout=0.3)
+    client = h.connect()
+    h.wait_ready()
+    sim.send_status()
+    wait_status_seen(h, sim, 1)
+    lose_first_motion_ack(sim)
+    client.send(protocol.MSG_SET_MOTION, 550, bytes([1, protocol.MOTION_SEND_OUT]))
+    assert wait_until(lambda: client.packets(protocol.MSG_ACK, 550), 1.5)
+    assert len(motion_frames(sim)) == 2
+
+
+def test_half_duplex_channel_going_idle_drops_a_motion_resend(start, sim):
+    h = start_half_duplex(start, resend_timeout=0.4)
+    client = h.connect()
+    h.wait_ready()
+    sim.send_status()
+    wait_status_seen(h, sim, 1)
+    lose_first_motion_ack(sim)
+    client.send(protocol.MSG_SET_MOTION, 551, bytes([1, protocol.MOTION_SEND_OUT]))
+    wait_status_seen(h, sim, 2)
+    assert wait_until(lambda: h.daemon.status_motion[1] == protocol.MOTION_SEND_OUT)
+    # The firmware stops the channel itself before the resend is due.
+    sim.motion[1] = protocol.MOTION_IDLE
+    sim.send_status()
+    time.sleep(0.7)
+    assert len(motion_frames(sim)) == 1
+    assert sim.motion[1] == protocol.MOTION_IDLE
+
+
+def test_half_duplex_rising_error_flags_drop_a_motion_resend(start, sim):
+    h = start_half_duplex(start, resend_timeout=0.4)
+    client = h.connect()
+    h.wait_ready()
+    sim.send_status()
+    wait_status_seen(h, sim, 1)
+    sim.add_fault('drop', protocol.MSG_SET_MOTION)
+    client.send(protocol.MSG_SET_MOTION, 552, bytes([2, protocol.MOTION_SEND_OUT]))
+    assert wait_until(lambda: motion_frames(sim))
+    sim.error_flags = 0x0004
+    sim.send_status()
+    time.sleep(0.7)
+    assert len(motion_frames(sim)) == 1
+
+
+def test_half_duplex_first_status_after_open_only_seeds(start, sim):
+    h = start_half_duplex(start, resend_timeout=0.4)
+    client = h.connect()
+    h.wait_ready()
+    assert h.daemon.status_motion is None
+    sim.add_fault('drop', protocol.MSG_SET_MOTION)
+    client.send(protocol.MSG_SET_MOTION, 553, bytes([2, protocol.MOTION_SEND_OUT]))
+    assert wait_until(lambda: motion_frames(sim))
+    sim.error_flags = 0x0004
+    sim.send_status()
+    assert wait_until(lambda: client.packets(protocol.MSG_ACK, 553), 1.5)
+    assert len(motion_frames(sim)) == 2
+
+
+def test_half_duplex_status_reply_does_not_drop_a_motion_resend(start, sim):
+    h = start_half_duplex(start, resend_timeout=0.4)
+    client = h.connect()
+    h.wait_ready()
+    sim.send_status()
+    wait_status_seen(h, sim, 1)
+    sim.add_fault('drop', protocol.MSG_SET_MOTION)
+    client.send(protocol.MSG_SET_MOTION, 554, bytes([3, protocol.MOTION_SEND_OUT]))
+    assert wait_until(lambda: motion_frames(sim))
+    sim.error_flags = 0x0004
+    # A STATUS that answers a request is not an unsolicited stop event.
+    client.send(protocol.MSG_GET_STATUS, 555)
+    assert wait_until(lambda: client.packets(protocol.MSG_STATUS, 555))
+    assert wait_until(lambda: client.packets(protocol.MSG_ACK, 554), 1.5)
+
+
+def test_half_duplex_falling_error_flags_keep_a_motion_resend(start, sim):
+    h = start_half_duplex(start, resend_timeout=0.4)
+    client = h.connect()
+    h.wait_ready()
+    sim.error_flags = 0x0004
+    sim.send_status()
+    wait_status_seen(h, sim, 1)
+    sim.add_fault('drop', protocol.MSG_SET_MOTION)
+    client.send(protocol.MSG_SET_MOTION, 556, bytes([0, protocol.MOTION_SEND_OUT]))
+    assert wait_until(lambda: motion_frames(sim))
+    sim.error_flags = 0
+    sim.send_status()
+    assert wait_until(lambda: client.packets(protocol.MSG_ACK, 556), 1.5)

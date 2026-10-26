@@ -185,6 +185,9 @@ class TransportDaemon(object):
         self.pending_local_snapshot = []
         self.latest_status_dict = None
         self.last_semantic_status = None
+        # motion[] and error_flags from the last STATUS seen on this port.
+        self.status_motion = None
+        self.status_flags = 0
         self.status_file_due = 0.0
 
     def setup(self):
@@ -800,6 +803,8 @@ class TransportDaemon(object):
             self.next_serial_connect = time.monotonic() + self.args.reconnect
         self.latest_status_dict = None
         self.last_semantic_status = None
+        self.status_motion = None
+        self.status_flags = 0
         self._write_status_file(force=True)
         if notify and was_open:
             logging.warning('serial offline: %s', reason)
@@ -989,6 +994,10 @@ class TransportDaemon(object):
             self.resend.pop(cmd_id, None)
         if not cmd_id and msg_type in _FIRMWARE_STOP_EVENTS and self.resend:
             self._drop_superseded_resends(msg_type)
+        if msg_type == protocol.MSG_STATUS:
+            stopped = self._status_reports_stop(payload)
+            if stopped and not cmd_id and self.resend:
+                self._drop_superseded_resends(msg_type)
         if not (self.args.half_duplex and msg_type & 0x80 and cmd_id):
             self._dispatch_serial_packet(msg_type, seq, cmd_id, payload)
             return
@@ -1003,6 +1012,25 @@ class TransportDaemon(object):
             if len(self.answered) >= _MAX_ANSWERED:
                 self._expire_answered(float('inf'))
             self.answered[cmd_id] = now + _ANSWERED_TTL
+
+    def _status_reports_stop(self, payload):
+        """True when a channel went from moving to idle or a new error flag
+        appeared since the previous STATUS: the firmware stopped something on
+        its own. A host SET_MOTION(IDLE) whose ACK is lost but whose STATUS
+        arrives therefore drops its own resend, the safe direction."""
+        try:
+            status = protocol.parse_status(payload)
+        except (ValueError, struct.error):
+            return False
+        motion = tuple(status['motion'])
+        flags = int(status['error_flags'])
+        previous, previous_flags = self.status_motion, self.status_flags
+        self.status_motion, self.status_flags = motion, flags
+        if previous is None:
+            return False
+        went_idle = any(old != protocol.MOTION_IDLE and new == protocol.MOTION_IDLE
+                        for old, new in zip(previous, motion))
+        return went_idle or bool(flags & ~previous_flags)
 
     def _expire_answered(self, now):
         for cmd_id, expiry in list(self.answered.items()):

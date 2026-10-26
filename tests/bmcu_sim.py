@@ -127,6 +127,7 @@ class BmcuSim(object):
         self.now_channel = 0xff
         self.present = [0, 0, 0, 0]
         self.motion = [protocol.MOTION_IDLE] * 4
+        self.error_flags = 0
         # op_id -> {'type', 'channel', 'result'}; op_id is the request cmd_id.
         self.operations = {}
         self.operations_started = []
@@ -184,7 +185,7 @@ class BmcuSim(object):
             *([50] * 4),
             0x0f,
             *([0] * 4),
-            0x0f, 0x0f, 0,
+            0x0f, 0x0f, self.error_flags,
             *([0.0] * 4),
             *([1.65] * 4),
             *([0] * 4),
