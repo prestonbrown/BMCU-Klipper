@@ -54,6 +54,42 @@ _WRITE_GATE_MAX = 0.05
 # Each resend wait is resend_timeout scaled by a factor drawn from this range,
 # so host retries cannot phase-lock with the firmware's periodic STATUS.
 _RESEND_JITTER = (0.8, 1.2)
+# Linux struct serial_struct in native layout (72 bytes on 64-bit, 60 on
+# 32-bit); flags is the fifth int. ftdi_sio maps ASYNC_LOW_LATENCY to a 1 ms
+# latency timer, which lets the half-duplex write gate see an inbound frame
+# almost as soon as it starts.
+_SERIAL_STRUCT = struct.Struct('@iiIiiiiiHcciHHPHIL')
+_SERIAL_FLAGS_OFFSET = struct.calcsize('@iiIi')
+_ASYNC_LOW_LATENCY = 0x2000
+_TIOCGSERIAL = getattr(termios, 'TIOCGSERIAL', 0x541E)
+_TIOCSSERIAL = getattr(termios, 'TIOCSSERIAL', 0x541F)
+_serial_ioctl = fcntl.ioctl
+
+
+def request_low_latency(fd):
+    """Set ASYNC_LOW_LATENCY on a tty; returns None or why it was not set."""
+    buffer = bytearray(_SERIAL_STRUCT.size)
+    try:
+        _serial_ioctl(fd, _TIOCGSERIAL, buffer, True)
+        flags = struct.unpack_from('@i', buffer, _SERIAL_FLAGS_OFFSET)[0]
+        if flags & _ASYNC_LOW_LATENCY:
+            return None
+        struct.pack_into('@i', buffer, _SERIAL_FLAGS_OFFSET,
+                         flags | _ASYNC_LOW_LATENCY)
+        _serial_ioctl(fd, _TIOCSSERIAL, buffer, False)
+    except OSError as exc:
+        return exc.strerror or str(exc)
+    return None
+
+
+def _usb_latency_timer(port):
+    path = os.path.join('/sys/bus/usb-serial/devices',
+                        os.path.basename(os.path.realpath(port)), 'latency_timer')
+    try:
+        with open(path) as stream:
+            return stream.read(16).strip()
+    except OSError:
+        return ''
 
 class TransportDaemon(object):
     def __init__(self, args, rng=None):
@@ -618,6 +654,14 @@ class TransportDaemon(object):
                 os.set_blocking(connection.fileno(), False)
             except (AttributeError, OSError):
                 pass
+            if self.args.half_duplex:
+                reason = request_low_latency(connection.fileno())
+                if reason is None:
+                    latency = _usb_latency_timer(port)
+                    logging.info('serial low-latency on%s',
+                                 ' (latency_timer %s ms)' % latency if latency else '')
+                else:
+                    logging.info('serial low-latency not supported: %s', reason)
             self.serial = connection
             self.current_port = port
             self.serial_decoder = protocol.StreamDecoder()

@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 import argparse
+import errno
+import logging
+import os
 import random
 import socket
 import struct
@@ -723,3 +726,112 @@ def test_half_duplex_resend_waits_use_jitter(tmp_path, sim):
         assert all(b.time - a.time >= 0.115 for a, b in zip(wire, wire[1:]))
     finally:
         h.stop()
+
+
+def low_latency_records(caplog):
+    return [r for r in caplog.records if 'serial low-latency' in r.getMessage()]
+
+
+def test_half_duplex_open_survives_unsupported_low_latency(start, sim, caplog):
+    caplog.set_level(logging.INFO)
+    h = start_half_duplex(start)
+    h.wait_ready()
+    records = low_latency_records(caplog)
+    assert len(records) == 1
+    assert records[0].getMessage().startswith('serial low-latency not supported: ')
+    assert records[0].levelno == logging.INFO
+
+
+def test_full_duplex_never_requests_low_latency(start, sim, monkeypatch, caplog):
+    caplog.set_level(logging.INFO)
+    calls = []
+    monkeypatch.setattr(bmcu_transportd, '_serial_ioctl',
+                        lambda *args: calls.append(args))
+    h = start()
+    h.wait_ready()
+    assert calls == []
+    assert low_latency_records(caplog) == []
+
+
+def test_half_duplex_requests_low_latency_once_per_open(start, sim, monkeypatch, caplog):
+    caplog.set_level(logging.INFO)
+    calls = []
+
+    def fake(fd, request, *rest):
+        calls.append(request)
+        raise OSError(errno.ENOTTY, 'Inappropriate ioctl for device')
+    monkeypatch.setattr(bmcu_transportd, '_serial_ioctl', fake)
+    h = start_half_duplex(start)
+    h.wait_ready()
+    assert calls == [bmcu_transportd._TIOCGSERIAL]
+    assert [r.getMessage() for r in low_latency_records(caplog)] == [
+        'serial low-latency not supported: Inappropriate ioctl for device']
+
+
+class FakeSerialIoctl(object):
+    def __init__(self, flags, fail_set=None):
+        self.original = bytearray(range(1, bmcu_transportd._SERIAL_STRUCT.size + 1))
+        struct.pack_into('@i', self.original, bmcu_transportd._SERIAL_FLAGS_OFFSET, flags)
+        self.fail_set = fail_set
+        self.written = None
+        self.requests = []
+
+    def __call__(self, fd, request, buffer, mutate=False):
+        self.requests.append(request)
+        if request == bmcu_transportd._TIOCGSERIAL:
+            assert mutate is True and len(buffer) == len(self.original)
+            buffer[:] = self.original
+            return 0
+        if self.fail_set is not None:
+            raise OSError(self.fail_set, os.strerror(self.fail_set))
+        self.written = bytes(buffer)
+        return 0
+
+
+def test_low_latency_sets_only_the_flag_bit(monkeypatch):
+    fake = FakeSerialIoctl(0x10000040)
+    monkeypatch.setattr(bmcu_transportd, '_serial_ioctl', fake)
+    assert bmcu_transportd.request_low_latency(5) is None
+    assert fake.requests == [bmcu_transportd._TIOCGSERIAL, bmcu_transportd._TIOCSSERIAL]
+    expected = bytearray(fake.original)
+    struct.pack_into('@i', expected, bmcu_transportd._SERIAL_FLAGS_OFFSET,
+                     0x10000040 | 0x2000)
+    assert fake.written == bytes(expected)
+    assert len(fake.written) == struct.calcsize('@iiIiiiiiHcciHHPHIL')
+
+
+def test_low_latency_already_set_writes_nothing(monkeypatch):
+    fake = FakeSerialIoctl(0x2000)
+    monkeypatch.setattr(bmcu_transportd, '_serial_ioctl', fake)
+    assert bmcu_transportd.request_low_latency(5) is None
+    assert fake.requests == [bmcu_transportd._TIOCGSERIAL]
+
+
+def test_low_latency_set_refused_reports_reason(monkeypatch):
+    fake = FakeSerialIoctl(0, fail_set=errno.EPERM)
+    monkeypatch.setattr(bmcu_transportd, '_serial_ioctl', fake)
+    assert bmcu_transportd.request_low_latency(5) == os.strerror(errno.EPERM)
+
+
+def test_serial_struct_layout_matches_kernel():
+    size = bmcu_transportd._SERIAL_STRUCT.size
+    assert size == (72 if struct.calcsize('P') == 8 else 60)
+    assert bmcu_transportd._SERIAL_FLAGS_OFFSET == 16
+
+
+def test_half_duplex_logs_low_latency_on_with_latency_timer(start, sim, monkeypatch, caplog):
+    caplog.set_level(logging.INFO)
+    fake = FakeSerialIoctl(0)
+    monkeypatch.setattr(bmcu_transportd, '_serial_ioctl', fake)
+    ports = []
+    monkeypatch.setattr(bmcu_transportd, '_usb_latency_timer',
+                        lambda port: ports.append(port) or '1')
+    h = start_half_duplex(start)
+    h.wait_ready()
+    assert ports == [sim.port]
+    assert [r.getMessage() for r in low_latency_records(caplog)] == [
+        'serial low-latency on (latency_timer 1 ms)']
+
+
+def test_usb_latency_timer_reads_sysfs_or_returns_empty(tmp_path):
+    assert bmcu_transportd._usb_latency_timer(str(tmp_path / 'ttyNOPE9')) == ''
