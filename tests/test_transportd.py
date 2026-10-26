@@ -79,7 +79,8 @@ class Harness(object):
             status_interval=0.5, connect_settle=0.0,
             status_file=str(tmp_path / 'status.json'),
             settings_digest='', lifetime_lock=lock, process_record={},
-            half_duplex=False, resend_timeout=0.25, resend_attempts=3)
+            half_duplex=False, resend_timeout=0.25, resend_attempts=3,
+            rx_quiet_ms=2.0)
         options.update(overrides)
         self.args = argparse.Namespace(**options)
         self.daemon = bmcu_transportd.TransportDaemon(
@@ -903,3 +904,109 @@ def test_default_rngs_give_daemons_different_wire_starts():
     starts = {bmcu_transportd.TransportDaemon(args).external_cmd for _ in range(8)}
     assert len(starts) > 1
     assert all(1 <= value < 0xF0000000 for value in starts)
+
+
+
+def test_partial_frame_age_restarts_after_a_truncated_frame(start, sim):
+    h = start_half_duplex(start)
+    h.wait_ready()
+    first = protocol.encode_packet(protocol.MSG_STATUS, 910, 0, sim.status_payload())
+    second = protocol.encode_packet(protocol.MSG_STATUS, 911, 0, sim.status_payload())
+    sim.send_raw(first[:20])
+    assert wait_until(lambda: h.daemon.serial_decoder.pending)
+    errors = h.daemon.serial_decoder.errors
+    between = time.monotonic()
+    # The first frame lost its terminator: the second frame's leading
+    # delimiter ends it as a decode error and a new partial frame begins.
+    sim.send_raw(second[:20])
+    assert wait_until(lambda: h.daemon.serial_decoder.errors > errors)
+    assert h.daemon.serial_decoder.pending
+    assert h.daemon.partial_since >= between
+
+
+def test_half_duplex_write_waits_for_rx_quiet_time(start, sim):
+    h = start_half_duplex(start, rx_quiet_ms=40.0, resend_timeout=1.0)
+    client = h.connect()
+    h.wait_ready()
+    statuses = h.daemon.latest_status
+    sim.send_status()
+    assert wait_until(lambda: h.daemon.latest_status is not statuses)
+    client.send(protocol.MSG_PING, 83, b'q')
+    assert wait_until(lambda: client.packets(protocol.MSG_PONG, 83))
+    status_sent = sim.frames('tx', protocol.MSG_STATUS)[-1].time
+    assert sim.frames('rx', protocol.MSG_PING)[-1].time - status_sent >= 0.04
+
+
+def test_rx_quiet_time_is_capped_by_the_write_gate_bound(start, sim):
+    h = start_half_duplex(start, rx_quiet_ms=5000.0, resend_timeout=1.0)
+    client = h.connect()
+    h.wait_ready()
+    statuses = h.daemon.latest_status
+    sim.send_status()
+    assert wait_until(lambda: h.daemon.latest_status is not statuses)
+    client.send(protocol.MSG_PING, 84, b'c')
+    assert wait_until(lambda: client.packets(protocol.MSG_PONG, 84), 1.0)
+    status_sent = sim.frames('tx', protocol.MSG_STATUS)[-1].time
+    assert sim.frames('rx', protocol.MSG_PING)[-1].time - status_sent < 0.25
+
+
+def test_parse_args_rx_quiet_default(monkeypatch):
+    monkeypatch.setattr('sys.argv', [
+        'bmcu_transportd', '--name', 'n', '--port', '/dev/null', '--socket', '/tmp/s',
+        '--log-file', '/tmp/l', '--status-file', '/tmp/f'])
+    assert bmcu_transportd.parse_args().rx_quiet_ms == 2.0
+
+
+class PipeSerial(object):
+    def __init__(self):
+        self.read_fd, self.write_fd = os.pipe()
+        os.set_blocking(self.read_fd, False)
+
+    def fileno(self):
+        return self.write_fd
+
+    def drain(self):
+        try:
+            return os.read(self.read_fd, 65536)
+        except BlockingIOError:
+            return b''
+
+    def close(self):
+        os.close(self.read_fd)
+        os.close(self.write_fd)
+
+
+def flush_daemon(half_duplex):
+    args = argparse.Namespace(half_duplex=half_duplex, resend_timeout=0.25,
+                              resend_attempts=3, rx_quiet_ms=2.0)
+    daemon = bmcu_transportd.TransportDaemon(args, random.Random(1))
+    daemon.serial = PipeSerial()
+    frames = []
+    for index in range(3):
+        before = len(daemon.serial_tx)
+        daemon._queue_serial(protocol.MSG_PING, 50 + index, b'x')
+        frames.append(bytes(daemon.serial_tx[before:]))
+    return daemon, frames
+
+
+def test_half_duplex_flush_writes_one_frame_per_pass():
+    daemon, frames = flush_daemon(True)
+    try:
+        daemon._flush_serial()
+        assert daemon.serial.drain() == frames[0]
+        daemon._flush_serial()
+        assert daemon.serial.drain() == frames[1]
+        daemon._flush_serial()
+        assert daemon.serial.drain() == frames[2]
+        assert not daemon.serial_tx and not daemon.serial_tx_frames
+    finally:
+        daemon.serial.close()
+
+
+def test_full_duplex_flush_writes_the_whole_queue():
+    daemon, frames = flush_daemon(False)
+    try:
+        daemon._flush_serial()
+        assert daemon.serial.drain() == b''.join(frames)
+    finally:
+        daemon.serial.close()

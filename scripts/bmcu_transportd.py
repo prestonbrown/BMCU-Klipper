@@ -125,7 +125,10 @@ class TransportDaemon(object):
         self.foreign_uid_until = {}
         self.serial_decoder = protocol.StreamDecoder()
         self.serial_tx = bytearray()
+        # [unsent bytes, cmd_id] for each frame in serial_tx, oldest first.
+        self.serial_tx_frames = collections.deque()
         self.partial_since = 0.0
+        self.last_rx_byte = 0.0
         self.resend = {}
         self.next_serial_connect = 0.0
         self.last_connect_error = ''
@@ -309,6 +312,7 @@ class TransportDaemon(object):
         if len(self.serial_tx) + len(frame) > _MAX_SERIAL_TX:
             raise RuntimeError('sidecar serial transmit queue overflow')
         self.serial_tx.extend(frame)
+        self.serial_tx_frames.append([len(frame), cmd_id])
         self.last_serial_tx = time.monotonic()
         if purpose is not None:
             self.internal_pending[cmd_id] = purpose
@@ -358,8 +362,18 @@ class TransportDaemon(object):
             logging.info('resent 0x%02X cmd=%d attempt %d',
                          entry['msg_type'], cmd_id, entry['sends'])
 
+    def _rx_quiet(self):
+        return min(self.args.rx_quiet_ms / 1000.0, _WRITE_GATE_MAX)
+
     def _write_gated(self, now):
-        return (self.args.half_duplex and self.serial_decoder.pending and
+        """Half-duplex holds transmit while a frame is arriving and for a
+        short quiet time after the last received byte, since the firmware
+        sends replies back to back."""
+        if not self.args.half_duplex:
+            return False
+        if now - self.last_rx_byte < self._rx_quiet():
+            return True
+        return (self.serial_decoder.pending and
                 now - self.partial_since < _WRITE_GATE_MAX)
 
     def _select_timeout(self, now):
@@ -369,7 +383,10 @@ class TransportDaemon(object):
         for entry in self.resend.values():
             timeout = min(timeout, entry['due'] - now)
         if self.serial_tx and self._write_gated(now):
-            timeout = min(timeout, self.partial_since + _WRITE_GATE_MAX - now)
+            release = self.last_rx_byte + self._rx_quiet()
+            if self.serial_decoder.pending:
+                release = max(release, self.partial_since + _WRITE_GATE_MAX)
+            timeout = min(timeout, release - now)
         return max(0.001, timeout)
 
     def _queue_reliable(self, frame):
@@ -669,6 +686,7 @@ class TransportDaemon(object):
             self.current_port = port
             self.serial_decoder = protocol.StreamDecoder()
             self.serial_tx[:] = b''
+            self.serial_tx_frames.clear()
             self.resend.clear()
             self.serial_generation = (self.serial_generation + 1) & 0xffffffff
             self.seq = 1
@@ -702,6 +720,7 @@ class TransportDaemon(object):
         self._release_serial_lease()
         self.current_port = ''
         self.serial_tx[:] = b''
+        self.serial_tx_frames.clear()
         self.serial_decoder = protocol.StreamDecoder()
         self.resend.clear()
         self.internal_pending.clear()
@@ -1097,11 +1116,16 @@ class TransportDaemon(object):
         data = os.read(self.serial.fileno(), 4096)
         if not data:
             raise OSError(errno.EIO, 'serial EOF')
+        self.last_rx_byte = time.monotonic()
         previous = self.serial_decoder.errors
         was_pending = self.serial_decoder.pending
         packets = self.serial_decoder.feed(data)
-        if self.serial_decoder.pending and (packets or not was_pending):
-            self.partial_since = time.monotonic()
+        # A frame that ended (decoded or discarded) means any partial frame
+        # now pending is a new one.
+        if self.serial_decoder.pending and (
+                packets or not was_pending or
+                self.serial_decoder.errors != previous):
+            self.partial_since = self.last_rx_byte
         if self.serial_decoder.incompatible_version is not None:
             raise RuntimeError('incompatible BMCU protocol version')
         if self.serial_decoder.errors != previous:
@@ -1121,14 +1145,29 @@ class TransportDaemon(object):
     def _flush_serial(self):
         if not self.serial_tx:
             return
+        limit = 4096
+        # Half-duplex writes one frame per pass so the write gate is checked
+        # again before each frame.
+        if self.args.half_duplex and self.serial_tx_frames:
+            limit = self.serial_tx_frames[0][0]
         try:
-            written = os.write(self.serial.fileno(), self.serial_tx[:4096])
+            written = os.write(self.serial.fileno(), self.serial_tx[:limit])
         except OSError as exc:
             if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
                 return
             raise
         if written:
             del self.serial_tx[:written]
+            self._consume_tx_frames(written)
+
+    def _consume_tx_frames(self, written):
+        while written and self.serial_tx_frames:
+            head = self.serial_tx_frames[0]
+            taken = min(written, head[0])
+            head[0] -= taken
+            written -= taken
+            if not head[0]:
+                self.serial_tx_frames.popleft()
 
     def _flush_client(self):
         if self.client is None or not self.client_tx:
@@ -1288,6 +1327,7 @@ def parse_args():
     parser.add_argument('--half-duplex', action='store_true')
     parser.add_argument('--resend-timeout', type=float, default=0.25)
     parser.add_argument('--resend-attempts', type=int, default=3)
+    parser.add_argument('--rx-quiet-ms', type=float, default=2.0)
     args = parser.parse_args()
     args.expected_uid = str(args.expected_uid or '').strip().upper()
     args.exclude_ports = tuple(str(value) for value in (args.exclude_port or []) if value)
