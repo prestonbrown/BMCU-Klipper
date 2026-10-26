@@ -693,6 +693,9 @@ class FixedUniform(object):
         self.calls.append((low, high))
         return high if self.end == 'high' else low
 
+    def randrange(self, start, stop):
+        return start
+
 
 @pytest.mark.parametrize('end,factor', [('low', 0.8), ('high', 1.2)])
 def test_resend_wait_jitter_bounds(end, factor):
@@ -835,3 +838,68 @@ def test_half_duplex_logs_low_latency_on_with_latency_timer(start, sim, monkeypa
 
 def test_usb_latency_timer_reads_sysfs_or_returns_empty(tmp_path):
     assert bmcu_transportd._usb_latency_timer(str(tmp_path / 'ttyNOPE9')) == ''
+
+
+def test_restarted_daemon_feed_starts_a_new_operation(tmp_path, sim):
+    first = Harness(tmp_path, sim, rng=random.Random(1))
+    try:
+        client = first.connect()
+        first.wait_ready()
+        client.send(protocol.MSG_FEED_DISTANCE, 400, FEED)
+        assert wait_until(lambda: client.packets(protocol.MSG_ACK, 400))
+        sim.complete_operation(sim.operations_started[-1])
+        assert wait_until(lambda: client.packets(protocol.MSG_OP_RESULT, 400))
+    finally:
+        first.stop()
+    # The sim, like the firmware, keeps its operation history across sessions.
+    second = Harness(tmp_path, sim, rng=random.Random(2))
+    try:
+        client = second.connect()
+        second.wait_ready()
+        client.send(protocol.MSG_FEED_DISTANCE, 400, FEED)
+        assert wait_until(lambda: client.packets(protocol.MSG_ACK, 400))
+        assert len(set(sim.operations_started)) == 2
+        time.sleep(0.1)
+        assert not client.packets(protocol.MSG_OP_RESULT, 400)
+    finally:
+        second.stop()
+
+
+class RecordingRandrange(random.Random):
+    def __init__(self, value):
+        random.Random.__init__(self, 3)
+        self.value = value
+        self.calls = []
+
+    def randrange(self, start, stop):
+        self.calls.append((start, stop))
+        return self.value
+
+
+def test_external_wire_ids_start_from_the_rng(tmp_path, sim):
+    rng = RecordingRandrange(123456789)
+    h = Harness(tmp_path, sim, rng=rng)
+    try:
+        client = h.connect()
+        h.wait_ready()
+        assert rng.calls == [(1, 0xF0000000)]
+        client.send(protocol.MSG_PING, 7, b'a')
+        client.send(protocol.MSG_PING, 8, b'b')
+        assert wait_until(lambda: client.packets(protocol.MSG_PONG, 8))
+        wire = sim.frames('rx', protocol.MSG_PING)
+        assert [f.cmd_id for f in wire] == [123456789, 123456790]
+    finally:
+        h.stop()
+
+
+def test_external_wire_ids_wrap_below_internal_base():
+    args = argparse.Namespace()
+    daemon = bmcu_transportd.TransportDaemon(args, RecordingRandrange(0xEFFFFFFF))
+    assert [daemon._next_external_cmd() for _ in range(3)] == [0xEFFFFFFF, 1, 2]
+
+
+def test_default_rngs_give_daemons_different_wire_starts():
+    args = argparse.Namespace()
+    starts = {bmcu_transportd.TransportDaemon(args).external_cmd for _ in range(8)}
+    assert len(starts) > 1
+    assert all(1 <= value < 0xF0000000 for value in starts)

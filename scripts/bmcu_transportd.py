@@ -108,7 +108,10 @@ class TransportDaemon(object):
 
         self.external_pending = {}
         self.operation_wire_by_client = {}
-        self.external_cmd = 1
+        # The firmware replays a remembered result for an operation whose
+        # op_id (the wire cmd_id) it has seen since boot, whatever the
+        # session, so each daemon starts its wire ids at a random point.
+        self.external_cmd = self.rng.randrange(1, _INTERNAL_BASE)
         self.reliable = collections.deque()
         self.latest_status = None
         self.latest_snapshot = None
