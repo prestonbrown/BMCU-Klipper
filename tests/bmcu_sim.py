@@ -43,6 +43,7 @@ _PAYLOAD_SIZE = {
     protocol.MSG_RESET_ERROR: 0, protocol.MSG_SET_ACTIVE_CH: 1,
     protocol.MSG_FEED_TO_CONTACT: 10, protocol.MSG_FEED_DISTANCE: 10,
     protocol.MSG_CHANNEL_RETRACT: 1, protocol.MSG_CHANNEL_PRELOAD: 1,
+    protocol.MSG_TAIL_RETRACT: 9,
 }
 
 _OPERATION_TYPES = {
@@ -51,6 +52,14 @@ _OPERATION_TYPES = {
     protocol.MSG_CHANNEL_RETRACT: protocol.OP_CHANNEL_RETRACT,
 }
 _OP_RESULT = struct.Struct('<IBBBBffI')
+_TAIL_RETRACT = struct.Struct('<BfI')
+
+REASON_TARGET = 1
+REASON_TIMEOUT = 2
+REASON_BUFFER_LIMIT = 5
+REASON_ABORTED = 6
+REASON_BUSY = 7
+REASON_NOT_CALIBRATED = 8
 
 Frame = collections.namedtuple(
     'Frame', 'direction time msg_type seq cmd_id payload raw note')
@@ -112,6 +121,7 @@ class BmcuSim(object):
             protocol.MSG_RESET_ERROR: self._on_ack,
             protocol.MSG_SET_ACTIVE_CH: self._on_set_active_ch,
             protocol.MSG_CHANNEL_PRELOAD: self._on_preload,
+            protocol.MSG_TAIL_RETRACT: self._on_tail_retract,
         }
         for msg_type, op_type in _OPERATION_TYPES.items():
             self.handlers[msg_type] = functools.partial(self._on_operation, op_type)
@@ -127,6 +137,12 @@ class BmcuSim(object):
         self.now_channel = 0xff
         self.present = [0, 0, 0, 0]
         self.motion = [protocol.MOTION_IDLE] * 4
+        self.route = [protocol.ROUTE_EMPTY] * 4
+        self.calibrated = [True] * 4
+        self.buffer_pct = [50] * 4
+        # Encoder position per channel in meters; pulling back decreases it.
+        self.meters = [0.0] * 4
+        self.pull_speed_mms = 2000.0
         self.error_flags = 0
         # op_id -> {'type', 'channel', 'result'}; op_id is the request cmd_id.
         self.operations = {}
@@ -176,21 +192,28 @@ class BmcuSim(object):
         self.session_id = (value & 0xffffffff) or 1
 
     def status_payload(self):
+        active = (0, 0, 0xff, protocol.OP_STATE_IDLE)
+        for op_id, operation in self.operations.items():
+            if operation['result'] is None:
+                active = (op_id, operation['type'], operation['channel'],
+                          protocol.OP_STATE_RUNNING)
+        calibrated_mask = sum(1 << channel for channel in range(4)
+                              if self.calibrated[channel])
         return struct.pack(
             '<B4B4B4B4BB4BBBH4f4f4hIII4B6B',
             self.now_channel,
-            *([protocol.ROUTE_EMPTY] * 4),
+            *self.route,
             *self.motion,
             *self.present,
-            *([50] * 4),
-            0x0f,
+            *self.buffer_pct,
+            calibrated_mask,
             *([0] * 4),
             0x0f, 0x0f, self.error_flags,
-            *([0.0] * 4),
+            *self.meters,
             *([1.65] * 4),
             *([0] * 4),
-            self.session_id, self.event_counter, 0,
-            0, 0xff, protocol.OP_STATE_IDLE, 0,
+            self.session_id, self.event_counter, active[0],
+            active[1], active[2], active[3], 0,
             0, 0, 0, 0, protocol.OP_STATE_IDLE, 0)
 
     def snapshot_payload(self):
@@ -273,7 +296,7 @@ class BmcuSim(object):
     def _run(self):
         while self._running:
             with self.lock:
-                timeout = 0.05
+                timeout = 0.01 if self._tail_retracts_running() else 0.05
                 if self._outbox:
                     timeout = max(0.0, min(timeout, self._outbox[0][0] - time.monotonic()))
             try:
@@ -298,6 +321,7 @@ class BmcuSim(object):
                 if data:
                     for packet in self.decoder.feed(data):
                         self.handle_packet(*packet)
+            self._advance_tail_retracts()
             self._flush_due()
 
     def handle_packet(self, msg_type, seq, cmd_id, payload):
@@ -407,7 +431,11 @@ class BmcuSim(object):
         """Finish running operations as aborted; returns their OP_RESULTs."""
         results = []
         for op_id, operation in self.operations.items():
-            if operation['result'] is None:
+            if operation['result'] is None and 'target_mm' in operation:
+                self._end_tail_retract(op_id, protocol.OP_STATE_ABORTED,
+                                       REASON_ABORTED)
+                results.append((protocol.MSG_OP_RESULT, op_id, operation['result']))
+            elif operation['result'] is None:
                 operation['result'] = _OP_RESULT.pack(
                     op_id, operation['type'], operation['channel'],
                     protocol.OP_STATE_ABORTED, 6, 100.0, 0.0, 0)
@@ -430,6 +458,84 @@ class BmcuSim(object):
     def _on_abort(self, cmd_id, _payload):
         return ([ack_reply(cmd_id)] + self._abort_running() +
                 [(protocol.MSG_STATUS, 0, self.status_payload())])
+
+    def _on_tail_retract(self, cmd_id, payload):
+        # The inlet sensor and route state are deliberately not consulted.
+        with self.lock:
+            operation = self.operations.get(cmd_id)
+            if operation is not None:
+                return self._on_operation(protocol.OP_TAIL_RETRACT, cmd_id, payload)
+            channel, millimeters, timeout_ms = _TAIL_RETRACT.unpack(payload)
+            if channel >= 4 or not 5.0 <= millimeters <= 2000.0:
+                return [error_reply(cmd_id, 31)]
+            reason = None
+            if not self.calibrated[channel]:
+                reason = REASON_NOT_CALIBRATED
+            elif (self._running_operation() or
+                  self.motion[channel] != protocol.MOTION_IDLE):
+                reason = REASON_BUSY
+            if reason is not None:
+                self.operations[cmd_id] = {
+                    'type': protocol.OP_TAIL_RETRACT, 'channel': channel,
+                    'result': _OP_RESULT.pack(
+                        cmd_id, protocol.OP_TAIL_RETRACT, channel,
+                        protocol.OP_STATE_FAILED, reason, millimeters, 0.0, 0)}
+                return [(protocol.MSG_OP_RESULT, cmd_id,
+                         self.operations[cmd_id]['result'])]
+            now = time.monotonic()
+            self.operations[cmd_id] = {
+                'type': protocol.OP_TAIL_RETRACT, 'channel': channel,
+                'result': None, 'target_mm': millimeters,
+                'start_m': self.meters[channel], 'started': now,
+                'deadline': now + timeout_ms / 1000.0}
+            self.operations_started.append(cmd_id)
+            return [ack_reply(cmd_id), (protocol.MSG_STATUS, 0, self.status_payload())]
+
+    def _running_operation(self):
+        return any(operation['result'] is None
+                   for operation in self.operations.values())
+
+    def _tail_retracts_running(self):
+        return any(operation['result'] is None and 'target_mm' in operation
+                   for operation in self.operations.values())
+
+    def _advance_tail_retracts(self):
+        """Move each running tail retract along at pull_speed_mms and end it
+        on target, timeout or buffer limit, as process_distance_op() does."""
+        finished = []
+        with self.lock:
+            now = time.monotonic()
+            for op_id, operation in self.operations.items():
+                if operation['result'] is not None or 'target_mm' not in operation:
+                    continue
+                channel = operation['channel']
+                pulled_mm = min(operation['target_mm'],
+                                (now - operation['started']) * self.pull_speed_mms)
+                self.meters[channel] = operation['start_m'] - pulled_mm / 1000.0
+                if self.buffer_pct[channel] < 5:
+                    outcome = (protocol.OP_STATE_FAILED, REASON_BUFFER_LIMIT)
+                elif pulled_mm >= operation['target_mm']:
+                    outcome = (protocol.OP_STATE_DONE, REASON_TARGET)
+                elif now >= operation['deadline']:
+                    outcome = (protocol.OP_STATE_FAILED, REASON_TIMEOUT)
+                else:
+                    continue
+                self._end_tail_retract(op_id, *outcome)
+                finished.append(op_id)
+        for op_id in finished:
+            self.send(protocol.MSG_OP_RESULT, op_id, self.operations[op_id]['result'])
+            self.send_status()
+
+    def _end_tail_retract(self, op_id, state, reason):
+        operation = self.operations[op_id]
+        channel = operation['channel']
+        measured_mm = abs(self.meters[channel] - operation['start_m']) * 1000.0
+        duration_ms = int((time.monotonic() - operation['started']) * 1000.0)
+        operation['result'] = _OP_RESULT.pack(
+            op_id, protocol.OP_TAIL_RETRACT, channel, state, reason,
+            operation['target_mm'], measured_mm, duration_ms)
+        self.route[channel] = protocol.ROUTE_EMPTY
+        self.event_counter += 1
 
     def _on_set_motion(self, cmd_id, payload):
         if payload[0] >= 4 or payload[1] > protocol.MOTION_STOP_ON_USE:

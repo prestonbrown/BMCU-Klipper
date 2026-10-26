@@ -35,6 +35,7 @@
 #define MSG_SET_SLOTS           0x22u
 #define MSG_CHANNEL_RETRACT      0x23u
 #define MSG_CHANNEL_PRELOAD      0x24u
+#define MSG_TAIL_RETRACT         0x25u
 #define MSG_CONFIG_GET          0x30u
 #define MSG_CONFIG_SET          0x31u
 #define MSG_CONFIG_SAVE         0x32u
@@ -90,6 +91,7 @@
 #define BMCU_CAP_LOAD_PRESSURE_PCT        (1u << 22)
 #define BMCU_CAP_LED_PREVIEW               (1u << 23)
 #define BMCU_CAP_LED_FILAMENT_PREVIEW      (1u << 24)
+#define BMCU_CAP_TAIL_RETRACT              (1u << 25)
 
 #define BMCU_MOTION_IDLE             0u
 #define BMCU_MOTION_SEND_OUT         1u

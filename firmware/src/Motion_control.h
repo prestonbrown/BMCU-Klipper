@@ -22,6 +22,8 @@ bool Motion_control_start_channel_retract(uint8_t channel);
 bool Motion_control_channel_retract_active(uint8_t channel);
 void Motion_control_cancel_channel_retract(uint8_t channel);
 void Motion_control_cancel_all_channel_retracts(void);
+bool Motion_control_start_tail_retract(uint8_t channel, float meters);
+bool Motion_control_tail_retract_active(uint8_t channel);
 void Motion_control_prepare_calibration(void);
 bool Motion_control_save_dm_key_none_thresholds(void);
 

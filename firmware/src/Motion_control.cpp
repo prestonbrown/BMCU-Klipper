@@ -2647,6 +2647,7 @@ static filament_now_position_enum filament_now_position[4];
 static float filament_pull_back_meters[4];
 
 static float filament_pull_back_target[4] = {0.200f, 0.200f, 0.200f, 0.200f};
+static uint8_t g_tail_retract_active[4];
 
 static uint8_t motor_motion_filament_pull_back_to_online_key(uint64_t time_now)
 {
@@ -2671,7 +2672,8 @@ static uint8_t motor_motion_filament_pull_back_to_online_key(uint64_t time_now)
                 g_pull_speed_set[i] = -PULL_V_FAST;
                 MOTOR_CONTROL[i].set_motion(filament_motion_enum::filament_motion_stop, 100, time_now);
                 filament_pull_back_target[i] = motion_control_pull_back_distance(i);
-                filament_now_position[i] = filament_redetect;
+                filament_now_position[i] =
+                    g_tail_retract_active[i] ? filament_idle : filament_redetect;
             }
             else if (g_key_empty[i] >= kKeyEmptyPublications)
             {
@@ -2728,9 +2730,27 @@ static uint8_t motor_motion_filament_pull_back_to_online_key(uint64_t time_now)
     return handled_mask;
 }
 
+// A tail retract runs the pull-back state machine for a set distance, with
+// the inlet-empty stop disabled and no re-detect once the distance is reached.
+bool Motion_control_start_tail_retract(uint8_t channel, float meters)
+{
+    if (channel >= kChCount || !g_host_motion_enabled) return false;
+    filament_pull_back_meters[channel] = encoder_meters(channel);
+    filament_pull_back_target[channel] = meters;
+    filament_now_position[channel] = filament_pulling_back;
+    g_tail_retract_active[channel] = 1u;
+    return true;
+}
+
+bool Motion_control_tail_retract_active(uint8_t channel)
+{
+    return channel < kChCount && g_tail_retract_active[channel] != 0u;
+}
+
 void Motion_control_stop_channel_motion(uint8_t channel)
 {
     if (channel >= kChCount) return;
+    g_tail_retract_active[channel] = 0u;
     filament_now_position[channel] = filament_idle;
     filament_pull_back_target[channel] = motion_control_pull_back_distance(channel);
     g_pull_remain_m[channel] = 0.0f;
@@ -2970,7 +2990,8 @@ static void motor_motion_run(int error, uint64_t time_now, uint32_t now_ticks,
     for (uint8_t ch = 0; ch < kChCount; ch++)
     {
         if (MC_ONLINE_key_stu[ch] != 0u || !ADC_DMA_ready() ||
-            filament_now_position[ch] != filament_pulling_back)
+            filament_now_position[ch] != filament_pulling_back ||
+            g_tail_retract_active[ch])
             g_key_empty[ch] = 0u;
         else if (g_key_sample_fresh && g_key_empty[ch] < kKeyEmptyPublications)
             ++g_key_empty[ch];
@@ -3140,6 +3161,7 @@ static void motor_motion_run(int error, uint64_t time_now, uint32_t now_ticks,
     {
         if (error || calibration_inhibit || !g_host_motion_enabled)
         {
+            g_tail_retract_active[i] = 0u;
             if (auto_unload_active[i])
                 Motion_control_cancel_channel_retract(i);
             else

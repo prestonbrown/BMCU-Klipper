@@ -1808,6 +1808,30 @@ class BMCUDevice(object):
         return self.start_feed_operation(protocol.MSG_FEED_DISTANCE, channel,
                                          millimeters, safety_buffer_pct, timeout_ms)
 
+    def start_tail_retract(self, channel, millimeters, timeout_ms):
+        # Pulls back by encoder distance alone; the firmware does not consult
+        # the inlet sensor or route state, so this can clear a runout tail.
+        channel = _bounded_int(channel, 'channel', 0, 3)
+        millimeters = _bounded_float(millimeters, 'distance', 5.0, 2000.0)
+        timeout_ms = _bounded_int(timeout_ms, 'operation timeout ms', 250, 300000)
+        payload = protocol.pack_tail_retract(channel, millimeters, timeout_ms)
+        control_plane_entered = self._control_plane_request_begin()
+        pending = None
+        op_id = None
+        try:
+            op_id = self._next_cmd_id()
+            pending = self._new_pending(
+                op_id, (protocol.MSG_ACK, protocol.MSG_OP_RESULT),
+                self.reactor.monotonic() + 2.0)
+            self.pending[op_id] = pending
+            self.send(protocol.MSG_TAIL_RETRACT, payload, op_id)
+            self._wait_pending(pending, 'tail retract start timeout')
+            return op_id
+        finally:
+            if pending is not None:
+                self.pending.pop(op_id, None)
+            self._control_plane_request_end(control_plane_entered)
+
     def runtime_sync(self, values, rgb, policy=None, channel_retract_m=None,
                      channel_autoload_m=None):
         payload = protocol.pack_runtime_sync(

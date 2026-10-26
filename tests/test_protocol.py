@@ -118,3 +118,17 @@ def test_stream_decoder_pending_tracks_unterminated_frame():
     assert decoder.pending
     decoder.feed(b'\x00')
     assert not decoder.pending
+
+
+def test_tail_retract_payload_layout():
+    payload = protocol.pack_tail_retract(2, 300.0, 20000)
+    assert len(payload) == 9
+    assert payload == struct.pack('<BfI', 2, 300.0, 20000)
+
+
+def test_op_result_accepts_tail_retract_type():
+    payload = struct.pack('<IBBBBffI', 9, protocol.OP_TAIL_RETRACT, 1,
+                          protocol.OP_STATE_DONE, 1, 300.0, 300.2, 5000)
+    result = protocol.parse_op_result(payload)
+    assert result['type'] == protocol.OP_TAIL_RETRACT
+    assert result['ok'] and result['reason'] == 'target'

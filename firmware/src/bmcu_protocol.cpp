@@ -117,7 +117,8 @@ enum : uint8_t
     OP_FEED_TO_CONTACT = 3,
     OP_FEED_DISTANCE = 4,
     OP_BUFFER_CALIBRATION = 5,
-    OP_CHANNEL_RETRACT = 6
+    OP_CHANNEL_RETRACT = 6,
+    OP_TAIL_RETRACT = 7
 };
 
 enum : uint8_t
@@ -191,7 +192,7 @@ static constexpr uint32_t kCapabilities =
     BMCU_CAP_INDEPENDENT_OUTPUTS | BMCU_CAP_CHANNEL_AUTOLOAD_RUNTIME |
     BMCU_CAP_RUNTIME_LIGHTING | BMCU_CAP_CHANNEL_RETRACT |
     BMCU_CAP_LOAD_PRESSURE_PCT | BMCU_CAP_LED_PREVIEW |
-    BMCU_CAP_LED_FILAMENT_PREVIEW;
+    BMCU_CAP_LED_FILAMENT_PREVIEW | BMCU_CAP_TAIL_RETRACT;
 
 static uint32_t now_ticks(void) { return time_ticks32(); }
 
@@ -846,11 +847,47 @@ static bool start_channel_retract_op(uint32_t op_id, uint8_t ch)
     return true;
 }
 
+// The inlet sensor and route state are not checked: this pulls a tail back
+// after the spool end has already left the inlet. Returns the failure reason,
+// or OP_REASON_NONE once the retract is running.
+static uint8_t start_tail_retract_op(uint32_t op_id, uint8_t ch,
+                                     float target_m, uint32_t timeout_ms)
+{
+    if (!MC_PULL_calibration_is_valid(ch)) return OP_REASON_NOT_CALIBRATED;
+    if (!Motion_control_encoder_io_ok(ch)) return OP_REASON_ENCODER_IO;
+    if (any_operation_active() || channel_motion_active(ch) ||
+        !Motion_control_start_tail_retract(ch, target_m))
+        return OP_REASON_BUSY;
+
+    memset(&g_op, 0, sizeof(g_op));
+    g_op.active = 1u;
+    g_op.type = OP_TAIL_RETRACT;
+    g_op.ch = ch;
+    g_op.op_id = op_id;
+    g_op.started_ticks = time_ticks64();
+    g_op.deadline_ticks = deadline_ticks_after_ms(timeout_ms);
+    g_op.start_meters = Motion_control_encoder_meters(ch);
+    g_op.target_meters = target_m;
+    g_last_op_state = OP_STATE_RUNNING;
+    g_last_op_reason = OP_REASON_NONE;
+    return OP_REASON_NONE;
+}
+
+static void release_op_motion(void)
+{
+    if (g_op.type == OP_CHANNEL_RETRACT)
+        Motion_control_cancel_channel_retract(g_op.ch);
+    else if (g_op.type == OP_TAIL_RETRACT)
+    {
+        Motion_control_stop_channel_motion(g_op.ch);
+        (void)ams_state_set_unloaded(g_op.ch);
+    }
+}
+
 static void finish_distance_op(uint8_t state, uint8_t reason)
 {
     if (!g_op.active) return;
-    if (g_op.type == OP_CHANNEL_RETRACT)
-        Motion_control_cancel_channel_retract(g_op.ch);
+    release_op_motion();
     const uint64_t now_ticks64 = time_ticks64();
     const float measured = fabsf(
         Motion_control_encoder_meters(g_op.ch) - g_op.start_meters);
@@ -869,8 +906,7 @@ static void finish_distance_op(uint8_t state, uint8_t reason)
 static void abort_distance_op_for_session_reset(void)
 {
     if (!g_op.active) return;
-    if (g_op.type == OP_CHANNEL_RETRACT)
-        Motion_control_cancel_channel_retract(g_op.ch);
+    release_op_motion();
     const uint64_t now_ticks64 = time_ticks64();
     const float measured = fabsf(
         Motion_control_encoder_meters(g_op.ch) - g_op.start_meters);
@@ -929,6 +965,27 @@ static void process_distance_op(void)
             OP_STATE_FAILED,
             MC_PULL_pct[g_op.ch] < 5u ? OP_REASON_BUFFER_LIMIT :
                                         OP_REASON_SENSOR);
+        return;
+    }
+
+    if (g_op.type == OP_TAIL_RETRACT)
+    {
+        uint8_t reason = OP_REASON_NONE;
+        if (!Motion_control_encoder_io_ok(g_op.ch))
+            reason = OP_REASON_ENCODER_IO;
+        else if (MC_PULL_pct[g_op.ch] < 5u)
+            reason = OP_REASON_BUFFER_LIMIT;
+        else if (measured >= g_op.target_meters)
+        {
+            finish_distance_op(OP_STATE_DONE, OP_REASON_TARGET);
+            return;
+        }
+        else if (!Motion_control_tail_retract_active(g_op.ch))
+            reason = OP_REASON_MOTION_STOPPED;
+        else if (now_ticks64 >= g_op.deadline_ticks)
+            reason = OP_REASON_TIMEOUT;
+        if (reason != OP_REASON_NONE)
+            finish_distance_op(OP_STATE_FAILED, reason);
         return;
     }
 
@@ -1061,6 +1118,8 @@ static int16_t command_payload_size(uint8_t type)
         return 5;
     case MSG_CONFIG_SET:
         return 6;
+    case MSG_TAIL_RETRACT:
+        return 9;
     case MSG_FEED_TO_CONTACT:
     case MSG_FEED_DISTANCE:
         return 10;
@@ -1457,6 +1516,32 @@ static void handle_packet(const uint8_t *data, uint16_t len)
         send_ack(header.cmd_id, 1u, 0u);
         g_event_counter++;
         send_status(0u);
+        break;
+    case MSG_TAIL_RETRACT:
+        if (replay_known_operation(header.cmd_id)) break;
+        {
+            float mm = 0.0f;
+            uint32_t timeout_ms = 0u;
+            memcpy(&mm, payload + 1, sizeof(float));
+            memcpy(&timeout_ms, payload + 5, sizeof(uint32_t));
+            // Written so a NaN fails the range test.
+            if (payload[0] >= 4u || !(mm >= 5.0f && mm <= 2000.0f))
+            {
+                send_error(header.cmd_id, 0xFFu, 31u);
+                break;
+            }
+            const float target_m = mm * 0.001f;
+            const uint8_t reason = start_tail_retract_op(
+                header.cmd_id, payload[0], target_m, timeout_ms);
+            if (reason != OP_REASON_NONE)
+            {
+                send_op_result(header.cmd_id, OP_TAIL_RETRACT, payload[0],
+                               OP_STATE_FAILED, reason, target_m, 0.0f, 0u);
+                break;
+            }
+            send_ack(header.cmd_id, 1u, 0u);
+            send_status(0u);
+        }
         break;
     case MSG_SET_SLOT_INFO:
         if (!apply_slot_payload(payload, header.len))

@@ -42,6 +42,7 @@ MSG_GET_SLOT_INFO = 0x21
 MSG_SET_SLOTS = 0x22
 MSG_CHANNEL_RETRACT = 0x23
 MSG_CHANNEL_PRELOAD = 0x24
+MSG_TAIL_RETRACT = 0x25
 MSG_CONFIG_GET = 0x30
 MSG_CONFIG_SET = 0x31
 MSG_CONFIG_SAVE = 0x32
@@ -100,6 +101,7 @@ OP_FEED_TO_CONTACT = 3
 OP_FEED_DISTANCE = 4
 OP_BUFFER_CALIBRATION = 5
 OP_CHANNEL_RETRACT = 6
+OP_TAIL_RETRACT = 7
 OP_STATE_IDLE = 0
 OP_STATE_RUNNING = 1
 OP_STATE_DONE = 2
@@ -115,6 +117,7 @@ CAP_CHANNEL_RETRACT = 1 << 21
 CAP_LOAD_PRESSURE_PCT = 1 << 22
 CAP_LED_PREVIEW = 1 << 23
 CAP_LED_FILAMENT_PREVIEW = 1 << 24
+CAP_TAIL_RETRACT = 1 << 25
 
 OP_REASON = {
     0: 'none', 1: 'target', 2: 'timeout', 3: 'no_filament',
@@ -131,6 +134,7 @@ _CAPS = struct.Struct('<BBBBBBBBI12s16s')
 _CALIBRATION = struct.Struct('<BBBbfffff')
 _OP_RESULT = struct.Struct('<IBBBBffI')
 _SLOT = struct.Struct('<BBBBBHH20s8s')
+_TAIL_RETRACT = struct.Struct('<BfI')
 _RUNTIME_SYNC_LEGACY = struct.Struct('<10f3B4B')
 _RUNTIME_SYNC_CHANNEL_AUTOLOAD = struct.Struct('<14f3B4B')
 
@@ -358,7 +362,8 @@ def parse_status(payload):
         raise ValueError('status contains an invalid calibration capture mask')
     if op_type not in (0, OP_ENCODER_TEST, OP_CHANNEL_AUTOLOAD,
                         OP_FEED_TO_CONTACT, OP_FEED_DISTANCE,
-                        OP_BUFFER_CALIBRATION, OP_CHANNEL_RETRACT):
+                        OP_BUFFER_CALIBRATION, OP_CHANNEL_RETRACT,
+                        OP_TAIL_RETRACT):
         raise ValueError('status contains an invalid operation type')
     if op_channel not in (0, 1, 2, 3, 0xff):
         raise ValueError('status contains an invalid operation channel')
@@ -455,7 +460,8 @@ def parse_op_result(payload):
     _require_finite((target_mm, measured_mm), 'operation result')
     if op_type not in (0, OP_ENCODER_TEST, OP_CHANNEL_AUTOLOAD,
                         OP_FEED_TO_CONTACT, OP_FEED_DISTANCE,
-                        OP_BUFFER_CALIBRATION, OP_CHANNEL_RETRACT):
+                        OP_BUFFER_CALIBRATION, OP_CHANNEL_RETRACT,
+                        OP_TAIL_RETRACT):
         raise ValueError('invalid operation result type')
     if ch not in (0, 1, 2, 3, 0xff):
         raise ValueError('invalid operation result channel')
@@ -599,6 +605,9 @@ def pack_slots(slots):
             slot.get('temperature_min', 0), slot.get('temperature_max', 0),
             slot.get('material', '')))
     return bytes(payload)
+
+def pack_tail_retract(channel, millimeters, timeout_ms):
+    return _TAIL_RETRACT.pack(channel, millimeters, timeout_ms)
 
 def map_status_operation_id(payload, mapper):
     offset = _STATUS.size - struct.calcsize('<I4B6B')
