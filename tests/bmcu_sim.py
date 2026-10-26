@@ -38,6 +38,8 @@ _PAYLOAD_SIZE = {
     protocol.MSG_GET_CAPS: 0, protocol.MSG_GET_SNAPSHOT: 0,
     protocol.MSG_GET_OP_RESULT: 4, protocol.MSG_ABORT_OP: 0,
     protocol.MSG_UPDATE_CANCEL: 0, protocol.MSG_STOP_ALL: 0,
+    protocol.MSG_UPDATE_PREPARE: 0, protocol.MSG_SET_MOTION: 2,
+    protocol.MSG_MARK_LOADED: 1, protocol.MSG_MARK_UNLOADED: 1,
     protocol.MSG_RESET_ERROR: 0, protocol.MSG_SET_ACTIVE_CH: 1,
     protocol.MSG_FEED_TO_CONTACT: 10, protocol.MSG_FEED_DISTANCE: 10,
     protocol.MSG_CHANNEL_RETRACT: 1, protocol.MSG_CHANNEL_PRELOAD: 1,
@@ -100,8 +102,12 @@ class BmcuSim(object):
             protocol.MSG_GET_STATUS: self._on_get_status,
             protocol.MSG_GET_SNAPSHOT: self._on_get_snapshot,
             protocol.MSG_UPDATE_CANCEL: self._on_ack,
-            protocol.MSG_ABORT_OP: self._on_ack,
-            protocol.MSG_STOP_ALL: self._on_ack,
+            protocol.MSG_ABORT_OP: self._on_abort,
+            protocol.MSG_STOP_ALL: self._on_stop_all,
+            protocol.MSG_UPDATE_PREPARE: self._on_ack,
+            protocol.MSG_SET_MOTION: self._on_set_motion,
+            protocol.MSG_MARK_LOADED: self._on_ack,
+            protocol.MSG_MARK_UNLOADED: self._on_ack,
             protocol.MSG_RESET_ERROR: self._on_ack,
             protocol.MSG_SET_ACTIVE_CH: self._on_set_active_ch,
             protocol.MSG_CHANNEL_PRELOAD: self._on_preload,
@@ -119,6 +125,7 @@ class BmcuSim(object):
         self.event_counter = 1
         self.now_channel = 0xff
         self.present = [0, 0, 0, 0]
+        self.motion = [protocol.MOTION_IDLE] * 4
         # op_id -> {'type', 'channel', 'result'}; op_id is the request cmd_id.
         self.operations = {}
         self.operations_started = []
@@ -171,7 +178,7 @@ class BmcuSim(object):
             '<B4B4B4B4BB4BBBH4f4f4hIII4B6B',
             self.now_channel,
             *([protocol.ROUTE_EMPTY] * 4),
-            *([protocol.MOTION_IDLE] * 4),
+            *self.motion,
             *self.present,
             *([50] * 4),
             0x0f,
@@ -393,6 +400,34 @@ class BmcuSim(object):
                 op_id, operation['type'], operation['channel'], state, 1,
                 100.0, 100.0, 1000)
         self.send(protocol.MSG_OP_RESULT, op_id, operation['result'])
+
+    def _abort_running(self):
+        """Finish running operations as aborted; returns their OP_RESULTs."""
+        results = []
+        for op_id, operation in self.operations.items():
+            if operation['result'] is None:
+                operation['result'] = _OP_RESULT.pack(
+                    op_id, operation['type'], operation['channel'],
+                    protocol.OP_STATE_ABORTED, 6, 100.0, 0.0, 0)
+                results.append((protocol.MSG_OP_RESULT, op_id, operation['result']))
+        return results
+
+    def _on_stop_all(self, cmd_id, _payload):
+        # stop_all_motion(): every channel idle, running operations aborted.
+        self.motion = [protocol.MOTION_IDLE] * 4
+        self.preloading.clear()
+        return ([ack_reply(cmd_id)] + self._abort_running() +
+                [(protocol.MSG_STATUS, 0, self.status_payload())])
+
+    def _on_abort(self, cmd_id, _payload):
+        return ([ack_reply(cmd_id)] + self._abort_running() +
+                [(protocol.MSG_STATUS, 0, self.status_payload())])
+
+    def _on_set_motion(self, cmd_id, payload):
+        if payload[0] >= 4 or payload[1] > protocol.MOTION_STOP_ON_USE:
+            return [error_reply(cmd_id, 3)]
+        self.motion[payload[0]] = payload[1]
+        return [ack_reply(cmd_id), (protocol.MSG_STATUS, 0, self.status_payload())]
 
     def _on_preload(self, cmd_id, payload):
         # A preload is not keyed by op_id: a repeat finds the channel's motion

@@ -1035,3 +1035,106 @@ def test_half_duplex_resend_timer_starts_when_the_frame_is_written():
         assert daemon.resend[cmd]['due'] is None
     finally:
         daemon.serial.close()
+
+
+def motion_frames(sim, channel=None):
+    return [f for f in sim.frames('rx', protocol.MSG_SET_MOTION)
+            if channel is None or f.payload[0] == channel]
+
+
+def test_half_duplex_lost_motion_is_not_resent_after_stop_all(start, sim):
+    h = start_half_duplex(start)
+    client = h.connect()
+    h.wait_ready()
+    sim.add_fault('ignore', protocol.MSG_SET_MOTION)
+    client.send(protocol.MSG_SET_MOTION, 500, bytes([1, protocol.MOTION_SEND_OUT]))
+    client.send(protocol.MSG_STOP_ALL, 501)
+    assert wait_until(lambda: client.packets(protocol.MSG_ACK, 501))
+    time.sleep(0.4)
+    assert len(motion_frames(sim)) == 1
+    assert sim.motion == [protocol.MOTION_IDLE] * 4
+    assert not client.packets(protocol.MSG_ACK, 500)
+
+
+def test_half_duplex_lost_stop_all_is_not_resent_after_a_newer_operation(start, sim):
+    h = start_half_duplex(start)
+    client = h.connect()
+    h.wait_ready()
+    sim.add_fault('ignore', protocol.MSG_STOP_ALL)
+    client.send(protocol.MSG_STOP_ALL, 502)
+    client.send(protocol.MSG_FEED_DISTANCE, 503, FEED)
+    assert wait_until(lambda: client.packets(protocol.MSG_ACK, 503))
+    time.sleep(0.4)
+    assert len(sim.frames('rx', protocol.MSG_STOP_ALL)) == 1
+    assert not client.packets(protocol.MSG_OP_RESULT, 503)
+
+
+def test_half_duplex_lost_stop_all_alone_is_resent(start, sim):
+    h = start_half_duplex(start)
+    client = h.connect()
+    h.wait_ready()
+    sim.add_fault('ignore', protocol.MSG_STOP_ALL)
+    client.send(protocol.MSG_STOP_ALL, 504)
+    assert wait_until(lambda: client.packets(protocol.MSG_ACK, 504))
+    assert len(sim.frames('rx', protocol.MSG_STOP_ALL)) == 2
+
+
+def test_half_duplex_newer_motion_drops_an_older_motion_resend(start, sim):
+    h = start_half_duplex(start)
+    client = h.connect()
+    h.wait_ready()
+    sim.add_fault('ignore', protocol.MSG_SET_MOTION)
+    client.send(protocol.MSG_SET_MOTION, 505, bytes([0, protocol.MOTION_SEND_OUT]))
+    client.send(protocol.MSG_SET_MOTION, 506, bytes([2, protocol.MOTION_PULL_BACK]))
+    assert wait_until(lambda: client.packets(protocol.MSG_ACK, 506))
+    time.sleep(0.4)
+    assert len(motion_frames(sim, 0)) == 1
+    assert sim.motion[0] == protocol.MOTION_IDLE
+    assert sim.motion[2] == protocol.MOTION_PULL_BACK
+
+
+def test_half_duplex_concurrent_reads_both_recover(start, sim):
+    h = start_half_duplex(start)
+    client = h.connect()
+    h.wait_ready()
+    sim.add_fault('ignore', protocol.MSG_GET_STATUS, count=2)
+    client.send(protocol.MSG_GET_STATUS, 507)
+    client.send(protocol.MSG_GET_STATUS, 508)
+    assert wait_until(lambda: client.packets(protocol.MSG_STATUS, 507) and
+                      client.packets(protocol.MSG_STATUS, 508))
+    assert len(sim.frames('rx', protocol.MSG_GET_STATUS)) == 4
+
+
+def test_half_duplex_read_does_not_drop_a_motion_resend(start, sim):
+    h = start_half_duplex(start)
+    client = h.connect()
+    h.wait_ready()
+    sim.add_fault('ignore', protocol.MSG_SET_MOTION)
+    client.send(protocol.MSG_SET_MOTION, 509, bytes([3, protocol.MOTION_SEND_OUT]))
+    client.send(protocol.MSG_PING, 510, b'r')
+    assert wait_until(lambda: client.packets(protocol.MSG_ACK, 509))
+    assert sim.motion[3] == protocol.MOTION_SEND_OUT
+
+
+def test_half_duplex_motion_does_not_drop_a_read_resend(start, sim):
+    h = start_half_duplex(start)
+    client = h.connect()
+    h.wait_ready()
+    sim.add_fault('ignore', protocol.MSG_GET_STATUS)
+    client.send(protocol.MSG_GET_STATUS, 511)
+    client.send(protocol.MSG_SET_MOTION, 512, bytes([1, protocol.MOTION_SEND_OUT]))
+    assert wait_until(lambda: client.packets(protocol.MSG_STATUS, 511))
+
+
+def test_half_duplex_update_prepare_drops_the_update_cancel_resend(start, sim):
+    sim.add_fault('ignore', protocol.MSG_UPDATE_CANCEL)
+    h = start_half_duplex(start, resend_timeout=0.3)
+    client = h.connect()
+    assert wait_until(lambda: h.daemon.session_ready)
+    client.send(protocol.MSG_UPDATE_PREPARE, 513)
+    assert wait_until(lambda: client.packets(protocol.MSG_ACK, 513))
+    time.sleep(0.5)
+    assert len(sim.frames('rx', protocol.MSG_UPDATE_CANCEL)) == 1
+    cancel = sim.frames('rx', protocol.MSG_UPDATE_CANCEL)[0]
+    prepare = sim.frames('rx', protocol.MSG_UPDATE_PREPARE)[0]
+    assert prepare.time > cancel.time

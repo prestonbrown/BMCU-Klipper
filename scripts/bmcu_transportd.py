@@ -48,6 +48,21 @@ _RESEND_PURPOSES = frozenset(('confirm', 'resume_update', 'snapshot'))
 # A resent preload finds its own motion running and answers error 40, so a
 # preload that started would be reported as failed.
 _NO_RESEND_TYPES = frozenset((protocol.MSG_CHANNEL_PRELOAD,))
+# A late resend must never run after a newer command and undo it. Queuing one
+# of these stop/reset requests drops every pending resend; queuing any other
+# state-changing request drops the pending resends of state-changing requests.
+_STOP_TYPES = frozenset((
+    protocol.MSG_STOP_ALL, protocol.MSG_ABORT_OP, protocol.MSG_RESET_ERROR,
+    protocol.MSG_UPDATE_PREPARE,
+))
+# Requests that change nothing on the BMCU (the handshake frames included);
+# they neither drop resends nor are dropped.
+_PASSIVE_TYPES = frozenset((
+    protocol.MSG_PING, protocol.MSG_GET_STATUS, protocol.MSG_GET_CAPS,
+    protocol.MSG_GET_CALIBRATION, protocol.MSG_GET_OP_RESULT,
+    protocol.MSG_GET_SLOT_INFO, protocol.MSG_CONFIG_GET, protocol.MSG_NVM_READ,
+    protocol.MSG_GET_SNAPSHOT, protocol.MSG_HELLO, protocol.MSG_SESSION_CONFIRM,
+))
 # Half-duplex writes wait at most this long for a partial inbound frame to
 # finish, so line noise cannot hold transmit forever.
 _WRITE_GATE_MAX = 0.05
@@ -304,9 +319,12 @@ class TransportDaemon(object):
             except OSError:
                 pass
 
-    def _queue_serial(self, msg_type, cmd_id, payload=b'', purpose=None):
+    def _queue_serial(self, msg_type, cmd_id, payload=b'', purpose=None,
+                      resend=False):
         if self.serial is None:
             raise RuntimeError('serial transport is offline')
+        if not resend:
+            self._drop_superseded_resends(msg_type)
         frame = protocol.encode_packet(
             msg_type, self._next_seq(), cmd_id, payload)
         if len(self.serial_tx) + len(frame) > _MAX_SERIAL_TX:
@@ -332,6 +350,16 @@ class TransportDaemon(object):
             'due': None, 'sends': 1,
         }
 
+    def _drop_superseded_resends(self, msg_type):
+        if msg_type in _PASSIVE_TYPES:
+            return
+        for cmd_id, entry in list(self.resend.items()):
+            if (msg_type in _STOP_TYPES or
+                    entry['msg_type'] not in _PASSIVE_TYPES):
+                self.resend.pop(cmd_id)
+                logging.info('dropped resend of 0x%02X cmd=%d: superseded by 0x%02X',
+                             entry['msg_type'], cmd_id, msg_type)
+
     def _resend_wait(self):
         return self.args.resend_timeout * self.rng.uniform(*_RESEND_JITTER)
 
@@ -356,7 +384,8 @@ class TransportDaemon(object):
                 logging.warning('no reply to 0x%02X cmd=%d after %d sends',
                                 entry['msg_type'], cmd_id, entry['sends'])
                 continue
-            self._queue_serial(entry['msg_type'], cmd_id, entry['payload'])
+            self._queue_serial(entry['msg_type'], cmd_id, entry['payload'],
+                               resend=True)
             entry['sends'] += 1
             entry['due'] = None
             logging.info('resent 0x%02X cmd=%d attempt %d',
@@ -492,6 +521,8 @@ class TransportDaemon(object):
                 self._remove_external(wire)
         if orphaned and self.serial is not None and self.session_ready:
             try:
+                # Not resent: a late ABORT_OP would abort an operation the
+                # next client starts after it.
                 self._queue_internal(
                     protocol.MSG_ABORT_OP, b'', 'orphan_abort')
                 logging.warning(
