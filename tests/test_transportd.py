@@ -587,8 +587,9 @@ def test_half_duplex_lost_session_confirm_is_resent(tmp_path, sim, start, action
     began = time.monotonic()
     h = start_half_duplex(start)
     h.wait_ready()
-    # Ready before the 1 s HELLO restart, on the first session.
-    assert time.monotonic() - began < 0.9
+    # Ready on the first session: without the resend the handshake restarts
+    # with a second HELLO after 1 s.
+    assert time.monotonic() - began < 3.0
     assert len(sim.frames('rx', protocol.MSG_HELLO)) == 1
     confirms = sim.frames('rx', protocol.MSG_SESSION_CONFIRM)
     assert len(confirms) == 2
@@ -652,7 +653,9 @@ def test_partial_frame_age_restarts_with_each_new_frame(start, sim):
     assert h.daemon.partial_since >= between
 
 
-def test_full_duplex_write_ignores_partial_frame(start, sim):
+def test_full_duplex_write_ignores_partial_frame(start, sim, monkeypatch):
+    # A long bound makes a wrongly applied gate obvious on a loaded machine.
+    monkeypatch.setattr(bmcu_transportd, '_WRITE_GATE_MAX', 2.0)
     h = start()
     client = h.connect()
     h.wait_ready()
@@ -661,7 +664,7 @@ def test_full_duplex_write_ignores_partial_frame(start, sim):
     sent = time.monotonic()
     client.send(protocol.MSG_PING, 82, b'f')
     assert wait_until(lambda: client.packets(protocol.MSG_PONG, 82))
-    assert sim.frames('rx', protocol.MSG_PING)[-1].time - sent < 0.045
+    assert sim.frames('rx', protocol.MSG_PING)[-1].time - sent < 1.0
 
 
 def test_sim_replays_operations_and_rejects_repeated_preload():
