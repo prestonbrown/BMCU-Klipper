@@ -6,6 +6,9 @@
 #include "bmcu_config.h"
 #include "ams.h"
 #include "Motion_control.h"
+#if BMCU_SENSOR_DIAG
+#include "ADC_DMA.h"
+#endif
 #include "MC_PULL_calibration.h"
 #include "Flash_saves.h"
 #include "hal/time_hw.h"
@@ -1485,6 +1488,16 @@ static void handle_packet(const uint8_t *data, uint16_t len)
         {
             const uint16_t key = (uint16_t)(payload[0] | (payload[1] << 8));
             float value = 0.0f;
+#if BMCU_SENSOR_DIAG
+            // Read-only diagnostics: 0x7F00-0x7F07 return the filtered ADC
+            // voltages (even = PULL/hall, odd = ONLINE/inlet; ch3..ch0), and
+            // 0x7F10-0x7F13 the inlet none-threshold applied to each channel.
+            if ((key & 0xFFF8u) == 0x7F00u)
+                value = ADC_DMA_get_value()[key & 7u];
+            else if ((key & 0xFFFCu) == 0x7F10u)
+                value = MC_DM_KEY_NONE_THRESH[key & 3u];
+            else
+#endif
             if (!bmcu_config_get(key, &value)) { send_error(header.cmd_id, 0xFF, 8); break; }
             struct __attribute__((packed)) CV { uint16_t key; float value; } cv;
             cv.key = key;
